@@ -1,0 +1,9 @@
+{
+  "instanceId": "project-a",
+  "stateDir": "/var/lib/superagent/project-a",
+  "host": "127.0.0.1",
+  "port": 3083,
+  "paseo": {
+    "endpoint": "127.0.0.1:6767"
+  }
+}

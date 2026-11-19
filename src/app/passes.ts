@@ -40,7 +40,7 @@ export class Passes {
   request(): void {
     const { health } = this.host
     this.pump().then(() => {
-      if (health.get()?.state !== 'error' || this.host.lifetime.aborted) return
+      if (health.get()?.state !== 'error' || this.host.lifetime.aborted || !this.host.configured()) return
       health.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
     }, (error: unknown) => { health.set({ state: 'error', detail: `A pass failed: ${String(error)}`, at: now() }) })
   }

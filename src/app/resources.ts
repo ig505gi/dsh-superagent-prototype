@@ -1,7 +1,7 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionId } from '../runtime/types.ts'
 import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
-import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/paseo.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
@@ -11,7 +11,7 @@ import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inp
 import { threadTitle } from './views/records.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context } from '../runtime/context.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { Sessions } from './sessions.ts'
@@ -48,8 +48,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompts/<revision>', holds: 'one prompt version by number, or current, the one the Session works under', executor: true },
   { name: 'prompts/defaults', holds: 'the built-in prompt configuration, and the built-in parts by the key an override names' },
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
-  { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
-  { name: 'models/<provider>', holds: 'one provider\'s models' },
+  { name: 'models', holds: 'Paseo Agent Profiles, provider availability and the selections for both roles' },
+  { name: 'models/<provider>', holds: 'one provider\'s Agent Profiles' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
 ]
@@ -178,7 +178,8 @@ const ROUTES: readonly Route[] = [
     const prompts = host.prompts
     const bound = host.promptVersion(sessionId)
     const parts = () => Object.fromEntries(Object.entries(builtInParts()).map(([key, part]) => [key, part.text]))
-    const version = rest === 'current' ? bound : rest === 'defaults' && !ticketId ? { revision: 0, config: defaultPrompts(), parts: parts() }
+    const defaults = () => { try { return defaultPrompts(host.commands.deployment.forge.kind) } catch { return defaultPrompts() } }
+    const version = rest === 'current' ? bound : rest === 'defaults' && !ticketId ? { revision: 0, config: defaults(), parts: parts() }
       : /^\d+$/.test(rest) ? (Number(rest) === 0 && prompts.current().revision === 0 ? prompts.current() : prompts.version(Number(rest))) : undefined
     if (!version || (ticketId && !host.mayRead(sessionId, version.revision))) throw new Error('Unknown or inaccessible prompt version')
     return text({ ...read, resource: rest === 'current' ? `prompts/${version.revision}` : resource }, JSON.stringify(version))
@@ -191,13 +192,12 @@ const ROUTES: readonly Route[] = [
   ['models', async read => {
     const host = main(read), catalog = await host.context.sessionController.modelCatalog(), settings = host.store.settings()
     const roles = { orchestrator: settings.eval.model, worker: settings.executor.model }
-    return { default: catalog.default, roles, failures: catalog.failures,
-      providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })) }
+    return { ...catalog, roles }
   }],
   ['models/', async read => {
-    const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models
-    if (!models) throw new Error('Unknown model provider')
-    return list(read, (offset, count) => models.slice(offset, offset + count))
+    const profiles = (await main(read).context.sessionController.modelCatalog()).profiles.filter(profile => profile.provider === read.rest)
+    if (!profiles.length) throw new Error('No Agent Profiles for this provider')
+    return list(read, (offset, count) => profiles.slice(offset, offset + count))
   }],
   ['feishu/', async read => {
     const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)
@@ -225,6 +225,7 @@ const ROUTES: readonly Route[] = [
     const neighbours = host.store.read.neighbours(threadKey(found.threads[0]!), found.at, found.id)
     const around = { before: shown(neighbours.before), after: shown(neighbours.after) }
     return { ...card, ...await host.sourceLink(found, signal), acknowledgement: host.store.replyStatus(key('ack', found.id)) ?? 'not_requested',
+      ...(found.source === 'paseo' ? { conversation: found.meta.context ?? [] } : {}),
       ...(ref ? { context: feishuReferences(ref) } : {}),
       ...(offset === 0 ? {
         ...repliedTo ? { replied_to: triggerLine(repliedTo) } : {},

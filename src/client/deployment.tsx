@@ -1,12 +1,11 @@
 /**
- * Deployment settings view shared between the panel Settings tab and the DSH Plugin Manager config page.
- * Edits host-level plugin configuration limits through DSH `ConfigForm` when writable.
+ * Deployment settings view and standalone HTTP adapter.
+ * Displays instance details and edits machine limits via `/orchestrator/api/deployment` or an injected store.
  */
 import { useCallback, useMemo, useSyncExternalStore } from 'react'
-import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
-import type { ConfigPageForm } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+import type { DeploymentOp, DeploymentView } from '../app/api.ts'
 import { LIMITS } from '../limits.ts'
-import type { SetupView } from './api.ts'
+import { ApiError, usePoll, type Call, type SetupView } from './api.ts'
 import { InfoTip, Input } from './controls.tsx'
 import { SaveBar, useDraft } from './draft.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
@@ -14,8 +13,27 @@ import { Field, Fields } from './settings-kit.tsx'
 import { setupText, type T } from './text.ts'
 import { CheckSetupButton, Hint, KeyValues, Section, SetupMessage } from './widgets.tsx'
 
-export type DeploymentForm = ConfigPageForm | undefined
-type Op = Parameters<ConfigPageForm['mutate']>[0][number]
+export type DeploymentValue = DeploymentView['value']
+export interface DeploymentSnapshot {
+  status: 'loading' | 'ready' | 'unavailable'
+  value: DeploymentValue
+  revision: number | undefined
+  writable: boolean
+  readOnlyReason?: 'readonly' | 'unavailable'
+  error?: string
+}
+export interface DeploymentStore {
+  getSnapshot(): DeploymentSnapshot
+  subscribe(listener: () => void): () => void
+  mutate(ops: DeploymentOp[], revision: number): Promise<boolean | { revision: number }>
+  reload?: () => Promise<void>
+}
+export interface DeploymentFormAdapter {
+  state: DeploymentSnapshot
+  mutate: DeploymentStore['mutate']
+  reload?: () => Promise<void>
+}
+export type DeploymentForm = DeploymentFormAdapter | undefined
 
 const MACHINE_LIMITS = ['promptMaxChars', 'admissionContextMaxPages', 'admissionContextTimeoutMs'] as const
 type Limits = Record<typeof MACHINE_LIMITS[number], string>
@@ -23,38 +41,80 @@ const text = (value: unknown): string => typeof value === 'string' || typeof val
 const limitsOf = (values: object | undefined): Limits =>
   Object.fromEntries(MACHINE_LIMITS.map(key => [key, text((values as Record<string, unknown> | undefined)?.[key])])) as Limits
 
-export function usePageForm(form: ConfigForm<Record<string, unknown>> | undefined): DeploymentForm {
-  const subscribe = useCallback((listener: () => void) => form ? form.subscribe(listener) : () => {}, [form])
+const NOP = () => {}
+export function usePageForm(form: DeploymentStore | undefined): DeploymentForm {
+  const subscribe = useCallback((listener: () => void) => form ? form.subscribe(listener) : NOP, [form])
   const state = useSyncExternalStore(subscribe, () => form?.getSnapshot())
-  return useMemo(() => form && state ? { state, mutate: form.mutate.bind(form) } : undefined, [form, state])
+  return useMemo(() => form && state
+    ? { state, mutate: form.mutate.bind(form), ...form.reload ? { reload: form.reload.bind(form) } : {} }
+    : undefined, [form, state])
 }
 
-/** Deployment configuration form; falls back to read-only display when DSH config forms are unavailable or read-only. */
+/** Poll and mutate machine limits through `GET/PUT /orchestrator/api/deployment`. */
+export function useHttpDeploymentForm(call: Call, intervalMs = 5000): DeploymentForm {
+  const { data, error, reload } = usePoll(() => call('GET deployment'), [call], intervalMs)
+  return useMemo(() => {
+    const unavailable = !!error
+    const transient = error instanceof ApiError && (!!error.details.unreachable || error.status === 503)
+    const state: DeploymentSnapshot = unavailable ? {
+      status: 'unavailable',
+      value: data?.value ?? { stateDir: '' },
+      revision: data?.revision,
+      writable: false,
+      readOnlyReason: 'unavailable',
+      ...transient || !error.message ? {} : { error: error.message },
+    } : data ? {
+      status: 'ready',
+      value: data.value,
+      revision: data.revision,
+      writable: data.writable,
+      ...data.writable ? {} : { readOnlyReason: 'readonly' as const },
+    } : {
+      status: 'loading',
+      value: { stateDir: '' },
+      revision: undefined,
+      writable: false,
+    }
+    const mutate: DeploymentStore['mutate'] = async (ops, revision) => {
+      const updated = await call('PUT deployment', { body: { revision, ops } })
+      return { revision: updated.revision }
+    }
+    return { state, mutate, reload }
+  }, [call, data, error, reload])
+}
+
+/** Deployment configuration form; falls back to read-only display when unavailable or read-only. */
 export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup: SetupView; form: DeploymentForm; accounts?: boolean }) {
   const { t, notify } = usePanel()
   const snapshot = form?.state
   const editable = snapshot?.status === 'ready' && snapshot.writable
-  // Pass `revision` only while DSH serves writable values so a draft started before `ready` rebases once writable.
-  const draft = useDraft({ saved: limitsOf(editable ? snapshot.value : setup.machine), revision: editable ? snapshot.revision : undefined,
-    reload: async () => {},
+  const savedSource = snapshot?.status === 'ready' ? snapshot.value : setup.machine
+  // Pass `revision` only while writable so a draft started before `ready` rebases once writable.
+  const draft = useDraft({ saved: limitsOf(savedSource), revision: editable ? snapshot.revision : undefined,
+    reload: async () => { await form?.reload?.() },
     save: async (value, revision, base) => {
-      const ops: Op[] = MACHINE_LIMITS.filter(key => value[key].trim() !== base[key].trim())
+      const ops: DeploymentOp[] = MACHINE_LIMITS.filter(key => value[key].trim() !== base[key].trim())
         .map(key => value[key].trim() ? { op: 'set', path: [key], value: Number(value[key]) } : { op: 'unset', path: [key] })
-      if (!form || !await form.mutate(ops, revision)) throw new Error(t('deploymentRefused'))
+      if (!form) throw new Error(t('deploymentRefused'))
+      const result = await form.mutate(ops, revision)
+      if (!result) throw new Error(t('deploymentRefused'))
       notify(t('saved'))
-      return { revision: revision + 1, restarting: false }
+      return { revision: typeof result === 'object' ? result.revision : revision + 1, restarting: false }
     } })
   const accounts = setup.accounts
-  // Remote browsers (`memory` mode) are read-only; `unavailable` indicates `dsh-superagent` is still starting.
-  const readOnlyHint = !form ? t('deploymentNoForms') : snapshot?.mode === 'memory' ? t('deploymentReadOnly')
-    : snapshot?.status === 'loading' ? t('loading') : snapshot?.status === 'unavailable' ? t('deploymentUnavailable')
-    : !editable ? t('deploymentReadOnly') : undefined
+  const readOnlyHint = !form ? t('deploymentNoForms')
+    : snapshot?.status === 'loading' ? t('loading')
+    : snapshot?.status === 'unavailable' ? (snapshot.error ?? t('deploymentUnavailable'))
+    : !editable ? (snapshot?.error ?? t('deploymentReadOnly')) : undefined
   const limit = (key: typeof MACHINE_LIMITS[number], label: string) => <Field label={label}>
     <Input type="number" min={LIMITS[key].min} max={LIMITS[key].max} step={1} value={draft.value[key]} disabled={!editable}
       onChange={event => draft.edit({ ...draft.value, [key]: event.target.value })} />
   </Field>
   const feishu = accounts?.feishu ? accounts.feishu.name || accounts.feishu.botId
     : setup.feishuProblem ? setupText(t, setup.feishuProblem) : t('deploymentFeishuNone')
+  const { instanceId, listen, paseoEndpoint } = snapshot?.value ?? {}
+  const bindHost = listen?.host.includes(':') ? `[${listen.host}]` : listen?.host
+  const stateDir = snapshot?.status === 'ready' && snapshot.value.stateDir ? snapshot.value.stateDir : setup.machine.stateDir
   return <form className="dt-form" onSubmit={event => { void draft.submit(event) }}>
     <Fields disabled={draft.busy}>
       <Hint>{t('deploymentIntro')}</Hint>
@@ -68,9 +128,14 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
       </Section>}
       <Section title={t('deploymentMachine')}>
         {readOnlyHint && <Hint>{readOnlyHint}</Hint>}
+        {(instanceId !== undefined || listen || paseoEndpoint) && <KeyValues rows={[
+          [t('deploymentInstance'), <span className="dt-mono">{instanceId ?? '—'}</span>],
+          [t('deploymentListen'), <span className="dt-mono">{listen ? `${bindHost}:${listen.port}` : '—'}</span>],
+          [t('deploymentPaseoEndpoint'), <span className="dt-mono">{paseoEndpoint ?? '—'}</span>],
+        ]} />}
         <div className="dt-field">
           <span className="dt-field-head">{t('deploymentStateDir')}<InfoTip text={t('deploymentStateDirHint')} /></span>
-          <span className="dt-mono">{setup.machine.stateDir}</span>
+          <span className="dt-mono">{stateDir}</span>
         </div>
       </Section>
       <Section title={t('deploymentLimits')} hint={t('deploymentLimitsHint')}>
@@ -83,8 +148,7 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
   </form>
 }
 
-/** Plugin Manager config page; includes derived repository and accounts because Source settings live in the main panel. */
-function PluginPage({ form }: { form: DeploymentForm }) {
+function DeploymentBody({ form }: { form: DeploymentForm }) {
   const { t } = usePanel()
   const { state, error } = usePanelData()
   return <div className="dt-embedded">
@@ -92,7 +156,13 @@ function PluginPage({ form }: { form: DeploymentForm }) {
       : error ? <p className="dt-error" role="alert">{error.message}</p> : <p className="dt-hint">{t('loading')}</p>}
   </div>
 }
-/** DSH Plugin Manager config view entry; renders nothing in `summary` mode because DSH displays the package description. */
-export function PluginConfig({ t, view, form }: { t: T; view: 'page' | 'summary'; form: DeploymentForm }) {
-  return view === 'page' ? <PanelProvider t={t} interval={10_000}><PluginPage form={form} /></PanelProvider> : null
+function HttpDeploymentBody() {
+  const { call } = usePanel()
+  return <DeploymentBody form={useHttpDeploymentForm(call, 10_000)} />
+}
+/** Standalone Deployment page including derived repository and account facts. */
+export function StandaloneDeployment({ t, form = 'http' }: { t: T; form?: DeploymentForm | 'http' }) {
+  return <PanelProvider t={t} interval={10_000}>
+    {form === 'http' ? <HttpDeploymentBody /> : <DeploymentBody form={form} />}
+  </PanelProvider>
 }

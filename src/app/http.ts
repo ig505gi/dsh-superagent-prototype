@@ -1,11 +1,10 @@
-/** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
-import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-host-webserver'
+/** Management routes and the compatibility wrapper for the loopback DSH web server. */
+import type { Context } from '../runtime/context.ts'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
-import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
+import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type DeploymentOp, type DeploymentView, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
-import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ModelCatalog } from '../runtime/types.ts'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
@@ -13,7 +12,7 @@ import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
 import type { Deployment, Machine } from '../deployment.ts'
-import type { DshExecutor } from '../executor/dsh.ts'
+import type { PaseoExecutor } from '../executor/paseo.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
@@ -27,6 +26,7 @@ import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
+import { DeploymentConflict, DeploymentReadOnly, DeploymentWriteSchema } from '../server/deployment.ts'
 
 export interface HttpHost {
   readonly store: Store
@@ -37,7 +37,7 @@ export interface HttpHost {
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
-  readonly executor: Pick<DshExecutor, 'activeCount'>
+  readonly executor: Pick<PaseoExecutor, 'activeCount'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -54,6 +54,15 @@ export interface HttpHost {
   requestPass(): void
   models(): Promise<ModelCatalog>
 }
+export interface ManagementServices {
+  deploymentSettings: {
+    read(): DeploymentView | Promise<DeploymentView>
+    write(ops: DeploymentOp[], revision: number): DeploymentView | Promise<DeploymentView>
+  }
+  /** Resolve the existing binding; session IDs are not presumed to be Paseo agent IDs. */
+  sessionLink(id: string): { serverId: string; agentId: string } | null | undefined
+    | Promise<{ serverId: string; agentId: string } | null | undefined>
+}
 /**
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
  * Route handlers throw it when request bodies are malformed or target records are missing, and registerHttp serializes its status and message in the HTTP response.
@@ -61,9 +70,12 @@ export interface HttpHost {
 class RouteError extends Error { constructor(readonly status: 400 | 404, message: string) { super(message) } }
 async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<unknown> {
   let size = 0; const chunks: Buffer[] = []
-  for await (const chunk of req) {
+  const tooLarge = () => new RouteError(400, `Request exceeds ${maxBytes} bytes`)
+  if (req.headers['content-length'] && Number(req.headers['content-length']) > maxBytes) { req.resume?.(); throw tooLarge() }
+  const stream = typeof req.iterator === 'function' ? req.iterator({ destroyOnReturn: false }) : req
+  for await (const chunk of stream) {
     const bytes = Buffer.from(chunk); size += bytes.length
-    if (size > maxBytes) throw new RouteError(400, `Request exceeds ${maxBytes} bytes`)
+    if (size > maxBytes) { req.resume?.(); throw tooLarge() }
     chunks.push(bytes)
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown }
@@ -80,14 +92,17 @@ export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number):
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof z.ZodError) {
-    const issues = error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message }))
+    const issues = error.issues.map(issue => ({ path: issue.path.join('.'),
+      message: issue.code === 'unrecognized_keys' ? 'Unrecognized key' : issue.message }))
     return [400, { error: `Invalid settings: ${issues.map(issue => issue.path).join(', ')}`, issues }]
   }
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
   if (error instanceof RouteError) return [error.status, { error: error.message }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
+  if (error instanceof DeploymentReadOnly) return [403, { error: error.message }]
+  if (error instanceof DeploymentConflict) return [409, { error: error.message }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
-  return [500, { error: error instanceof Error ? error.message : String(error) }]
+  return [500, { error: 'Internal server error' }]
 }
 
 function machineView({ stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }: Machine) {
@@ -98,10 +113,10 @@ function setupView(runtime: HttpHost) {
   const resolved = runtime.configured() ? runtime.deployment : undefined
   return {
     machine: machineView(runtime.machine), problem: runtime.setupProblem ?? null, feishuProblem: runtime.feishuProblem ?? null,
-    accounts: resolved ? { repository: resolved.repository, agent: resolved.github.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
+    accounts: resolved ? { repository: resolved.repository, agent: resolved.forge.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
   }
 }
-/** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
+/** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/superagent status --config <path>` (`docs/006-deployment.md`). */
 export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
@@ -125,7 +140,7 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
   // Each built-in part with the key of its text, which an override records as its base, and for the overrides shown whose
   // built-in text changed since, the text they were edited from when known.
   const parts = Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
-  return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
+  return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(runtime.configured() ? runtime.deployment.forge.kind : 'github'), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
     builtin: Object.keys(sourceSkills), skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
     ...runtime.sessions.status(), ...runtime.prompts.history(offset) }
 }
@@ -148,7 +163,14 @@ const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
 
-function routes(runtime: HttpHost): Routes {
+function agentLink(serverId: string, agentId: string): string {
+  const valid = (value: string) => typeof value === 'string' && !!value && value.trim() === value
+    && value !== '.' && value !== '..' && !/[\x00-\x1f\x7f]/.test(value)
+  if (!valid(serverId) || !valid(agentId)) throw new Error('Invalid session binding')
+  return `paseo://h/${encodeURIComponent(serverId)}/agent/${encodeURIComponent(agentId)}`
+}
+
+function routes(runtime: HttpHost, services: ManagementServices): Routes {
   const { store } = runtime
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
@@ -159,6 +181,16 @@ function routes(runtime: HttpHost): Routes {
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
+    'GET deployment': () => services.deploymentSettings.read(),
+    'PUT deployment': async ({ body }) => {
+      const request = DeploymentWriteSchema.parse(await body())
+      return services.deploymentSettings.write(request.ops, request.revision)
+    },
+    'GET sessions/:id/link': async ({ params }) => {
+      const target = await services.sessionLink(params.id)
+      if (!target) throw new RouteError(404, 'Session not found')
+      return { url: agentLink(target.serverId, target.agentId) }
+    },
     'POST sources/:id/labels': ({ params }) => runtime.settings.refreshLabels(params.id),
     'GET threads': ({ query }) => {
       const { filter, offset, limit } = ThreadsQuery.parse(query)
@@ -227,21 +259,40 @@ function match(table: Routes, method: string, segments: string[]) {
   }
   return undefined
 }
+/** The caller is responsible for authentication and origin checks before invoking this handler. */
+export function createManagementHandler(runtime: HttpHost, services: ManagementServices) {
+  const table = routes(runtime, services)
+  return async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
+    try {
+      let url: URL
+      try { url = new URL(req.url ?? '/', 'http://localhost') } catch { throw new RouteError(400, 'Invalid request URL') }
+      if (!url.pathname.startsWith('/orchestrator/api/')) return false
+      const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
+      if (!route) return false
+      await runtime.ready
+      const query = Object.fromEntries(url.searchParams)
+      json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))
+    } catch (error) { json(res, ...failure(error)) }
+    return true
+  }
+}
+
+/** Temporary DSH adapter: deployment is honestly read-only and session links are unavailable. */
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
   if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')
-  const table = routes(runtime)
-  const disposers = [
-    ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
-      const url = new URL(req.url ?? '/', 'http://localhost')
-      if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
-      try {
-        await runtime.ready
-        const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
-        if (!route) throw new RouteError(404, 'Unknown operation')
-        const query = Object.fromEntries(url.searchParams)
-        json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))
-      } catch (error) { json(res, ...failure(error)) }
-    } })]
-  return () => { for (const dispose of disposers) dispose() }
+  const handler = createManagementHandler(runtime, {
+    deploymentSettings: {
+      read: () => ({ revision: 0, value: machineView(runtime.machine), writable: false }),
+      write: () => { throw new DeploymentReadOnly() },
+    },
+    sessionLink: () => undefined,
+  })
+  return ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
+    let url: URL
+    try { url = new URL(req.url ?? '/', 'http://localhost') }
+    catch { json(res, 400, { error: 'Invalid request URL' }); return }
+    if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
+    if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+    if (!await handler(req, res)) json(res, 404, { error: 'Unknown operation' })
+  } })
 }

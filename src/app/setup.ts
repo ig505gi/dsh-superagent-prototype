@@ -1,14 +1,16 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context } from '../runtime/context.ts'
 import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
-import type { Settings, SettingsBlock } from '../policy.ts'
+import { policyVersion, type Settings, type SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
+import type { Store } from './store.ts'
 
 export interface SetupHost {
   readonly context: Context
   readonly machine: Machine
+  readonly store: Pick<Store, 'settings' | 'saveSettings'>
   readonly lifetime: AbortSignal
   restart(): void
 }
@@ -42,13 +44,39 @@ export class Setup {
   }
   configured(): boolean { return this.resolved !== undefined }
   /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
-  async run(settings: Settings): Promise<boolean> {
-    try { this.resolved = await this.resolve(settings); return true }
+  async run(): Promise<boolean> {
+    try {
+      const settings = await this.profiles(this.host.store.settings())
+      this.resolved = await this.resolve(settings)
+      return true
+    }
     catch (error) {
       if (!(error instanceof SetupError)) throw error
       this.problem = error.problem
       return false
     }
+  }
+  private async profiles(settings: Settings): Promise<Settings> {
+    const { context: { runtime }, store } = this.host
+    if (!runtime) return settings
+    const { main, worker } = runtime.config.paseo
+    const seeds = { eval: main.profileId, executor: worker.profileId }
+    const roles = ['eval', 'executor'] as const
+    const missing = roles.filter(role => !settings[role].model)
+    const pendingSeeds = missing.filter(role => seeds[role])
+    if (pendingSeeds.length) {
+      const catalog = await runtime.modelCatalog()
+      for (const role of pendingSeeds) {
+        const profile = catalog.profiles.find(item => item.profileId === seeds[role] && item.available)
+        if (!profile) continue
+        const { available: _available, ...model } = profile
+        settings = store.saveSettings({ ...settings, [role]: { ...settings[role], model } },
+          { source: 'internal', block: role, policyVersion: policyVersion(settings), policyChanged: false, notified: [] })
+      }
+    }
+    if (!settings.eval.model) throw new SetupError('evalProfileUnset')
+    if (!settings.executor.model) throw new SetupError('executorProfileUnset')
+    return settings
   }
   /** Trigger a restart to re-run setup, refusing if setup and Feishu are already healthy so running assignments are not interrupted. */
   check(): void {
@@ -61,7 +89,7 @@ export class Setup {
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
     const { machine } = this.host
     const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
+      : resolveDeployment(machine, block === 'source:gitlab' ? { gitlab: settings.sources.gitlab?.config } : { github: settings.sources.github?.config }, this.probe())
     await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
@@ -76,7 +104,7 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
+    const deployment = await resolveDeployment(machine, { github: settings.sources.github?.config, gitlab: settings.sources.gitlab?.config }, probe)
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem

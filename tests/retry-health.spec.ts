@@ -1,5 +1,5 @@
-import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
-import { SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { createAssistantMessage } from '../src/runtime/types.ts'
+import { SessionSeq, type SessionEvent } from '../src/runtime/types.ts'
 import { expect, it } from 'vitest'
 import { RetryHealth, type RetryHealthEvent } from '../src/app/retry-health.ts'
 

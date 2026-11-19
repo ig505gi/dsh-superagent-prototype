@@ -1,22 +1,23 @@
+import { trashSync } from './fixtures/trash.ts'
 /**
  * Model surface contract tests: verify registered tools, system prompts, skills, and session inputs for the
  * orchestrator and worker roles against tool schemas, environment variables, glossary rules (`docs/001`), and size budgets.
  */
-import { Context } from '@deepseek-ai/cordis'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { Context } from '../src/runtime/context.ts'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
-import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import type { UserMessage } from '../src/runtime/types.ts'
 import { latestAssignment } from '../src/core/index.ts'
 import { promptParts } from '../src/app/prompts.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { Runtime } from '../src/app/runtime.ts'
-import { workerSessionId } from '../src/executor/dsh.ts'
+import { workerSessionId } from '../src/executor/paseo.ts'
 import { Store } from '../src/app/store.ts'
 import { Commands } from '../src/infra/commands.ts'
-import { inputMessage } from '../src/executor/dsh.ts'
+import { inputMessage } from '../src/executor/paseo.ts'
 import { credentialHelper, workerGitConfig } from '../src/infra/environment.ts'
 import { IM_WORDS, NOTE_WORDS, checkedImText } from '../src/infra/text.ts'
 import { SettingsSchema } from '../src/policy.ts'
@@ -40,7 +41,7 @@ interface Skill { name: string; description: string; content: string }
 const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
-const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
+const EXECUTOR = 'src/executor/paseo.ts', ERRORS = 'src/core/errors.ts'
 const TICKETS = 'src/core/tickets.ts', ASSIGNMENTS = 'src/core/assignments.ts'
 /** Regex patterns compiled from `orchestrator_read` resource templates (`<…>` matches one path segment; `…` matches the rest). */
 const RESOURCE_NAMES = RESOURCES.map(({ name }) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/<[^>]+>/g, '[^/\\s]+').replace('…', '.+')}$`))
@@ -72,7 +73,7 @@ async function start() {
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const repository = { default_branch: 'master', permissions: { push: true } }
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
+  vi.spyOn(Commands.prototype, 'forge').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
@@ -150,7 +151,7 @@ async function start() {
     sources: { ...settings.sources, feishu: feishuSource } })
   const run = async (sessionId: string, name: string, args: unknown) =>
     await tools.get(sessionId)!.get(name)!.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
-  const stop = async () => { await runtime.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) }
+  const stop = async () => { await runtime.stop(); vi.restoreAllMocks(); trashSync(directory, { recursive: true, force: true }) }
   return { ctx, runtime, agents, tools, sections, skills, inputs, run, stop }
 }
 type Host = Awaited<ReturnType<typeof start>>

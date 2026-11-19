@@ -11,7 +11,7 @@ import type { Store } from './store.ts'
 export interface SourceContextDeps {
   readonly store: Pick<Store, 'atomic' | 'get' | 'set' | 'delete' | 'keys' | 'threads' | 'tickets' | 'triggers' | 'read'>
   readonly outbox: Pick<Outbox, 'send'>
-  readonly engine: Pick<EngineForSources, 'bindThread' | 'threadClosed'>
+  readonly engine: Pick<EngineForSources, 'bindThread' | 'bindChannel' | 'threadClosed'>
   readonly commands: Commands
   readonly sources: SourceRegistry
   /** Throws when accessed before initial setup completes. */
@@ -59,6 +59,10 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
     tickets: {
       get: id => store.tickets.get(id),
       open: () => store.tickets.open(),
+      bindChannel: (id, channel) => {
+        if (channel.source !== kind.kind || !deps.sources.channelAllowed(channel)) throw new Error('A Source may bind only an allowed channel of its own')
+        deps.engine.bindChannel(id, channel)
+      },
       bindThread: (id, thread, own) => { deps.engine.bindThread(id, thread, own) },
       threadClosed: (thread, outcome, at) => { deps.engine.threadClosed(thread, outcome, at) },
     },

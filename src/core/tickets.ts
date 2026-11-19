@@ -29,6 +29,21 @@ const STATUS_REQUEST = 'Report the current ticket status with orchestrator_repor
 export class Tickets extends EnginePart {
   constructor(options: EngineOptions, private readonly replies: Replies) { super(options) }
 
+  /** A Source upgrade may add its reply channel, without changing the ticket's mandate or waking its worker. */
+  bindChannel(ticketId: string, channel: ChannelRef): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const origin = this.repo.triggers.get(ticket.origin.triggerId)
+    if (origin?.source !== channel.source || !this.options.scope.scope(origin).listened) throw new UserError('noChannel')
+    if (origin.channel && !sameChannel(origin.channel, channel)) throw new UserError('noChannel')
+    if (!origin.channel) { origin.channel = channel; this.repo.triggers.save(origin) }
+    if (!ticket.channels.some(item => sameChannel(item, channel))) {
+      ticket.channels.push(channel)
+      this.repo.tickets.save(ticket)
+    }
+    return ticket
+  }
+
   /**
    * Create the ticket an accept decided, under `mandate`, with the Channels and Threads of the Eval's Triggers, its first
    * Assignment, and the acknowledgement the accept carries, and queue its launch. Its origin is the admissible Trigger that

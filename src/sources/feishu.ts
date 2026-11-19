@@ -1,5 +1,5 @@
 /** Feishu source kind definition, policy synchronization, and Cordis plugin entry. */
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context } from '../runtime/context.ts'
 import { z } from 'zod'
 import { FeishuBotSchema } from '../deployment.ts'
 import { feishuLink, sendFeishu } from './feishu-channel.ts'

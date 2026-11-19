@@ -4,8 +4,8 @@
  */
 import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
-import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
-import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import type { Api, ApiResponse, DeploymentOp, RouteParams } from '../../src/app/api.ts'
+import type { DeploymentSnapshot, DeploymentStore } from '../../src/client/deployment.tsx'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
 import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SourceStatusRow, SourceView, StateView, ThreadPageView,
@@ -94,17 +94,21 @@ export interface PanelServer {
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
   person: TicketRow[]; search: Pick<ApiResponse<'GET search'>, 'items' | 'threads'>; history: HistoryView
   requests: { path: string; method: string; body?: unknown }[]
+  headers: Record<string, string>[]
   /** Requests with undeclared query params or invalid body presence; asserted empty after each test. */
   misuse: string[]
   queued: Set<string>
   searching?: (query: string) => Promise<void>
   setup: SetupView
+  deploymentRevision: number
+  deploymentWritable: boolean
+  sessionLinks?: Record<string, string | null>
   health: Record<string, Health>
   /** When true, all API requests return an empty 404 to simulate the host plugin being stopped. */
   down: boolean
   /** Count of responses not yet consumed by the client. */
   pending: number
-  form?: ConfigForm<Record<string, unknown>> | undefined
+  form?: DeploymentStore | undefined
   opened: string[]
   dropped: DroppedReply[]
   failing: Extract<Problem, { kind: 'outgoing' }>['outgoing'][]
@@ -113,7 +117,7 @@ export let server: PanelServer
 
 function resolved() {
   const accounts = server.setup.accounts
-  return accounts ? testDeployment({ repository: accounts.repository, github: { cli: '/bin/false', login: accounts.agent, noreply: '' },
+  return accounts ? testDeployment({ repository: accounts.repository, forge: { kind: 'github', host: 'github.com', cli: '/bin/false', login: accounts.agent, noreply: '' },
     ...accounts.feishu ? { feishu: { cli: '/bin/false', ...accounts.feishu } } : { feishu: undefined } }) : undefined
 }
 /** Default source health: paused during setup; Feishu defaults to `socket closed` unless overridden or paused by setup. */
@@ -247,7 +251,8 @@ function initial(): PanelServer {
     en: 'Feishu message' } }
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
-    health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
+    health: {}, down: false, pending: 0, opened: [], requests: [], headers: [], misuse: [], queued: new Set(), dropped: [], failing: [],
+    deploymentRevision: 1, deploymentWritable: true,
     setup: { machine: MACHINE, problem: null, feishuProblem: null,
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
@@ -277,7 +282,7 @@ function initial(): PanelServer {
 }
 
 /** A refusal response carrying the host's HTTP status code and JSON error body. Returned by route handlers when a request is rejected. */
-class Refusal { constructor(readonly status: 400 | 404 | 409 | 500, readonly body: Record<string, unknown>) {} }
+class Refusal { constructor(readonly status: 400 | 403 | 404 | 409 | 500, readonly body: Record<string, unknown>) {} }
 const refuse = (status: Refusal['status'], error: string, more: Record<string, unknown> = {}) => new Refusal(status, { error, ...more })
 type Query<K extends keyof Api> = Api[K] extends { query?: infer Q } ? keyof NonNullable<Q> & string : never
 type Body<K extends keyof Api> = Api[K] extends { body: infer B } ? B : undefined
@@ -300,6 +305,32 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   } },
   'GET sources': { answer: sourceStatuses },
   'GET settings': { answer: settingsView },
+  'GET deployment': { answer: () => ({
+    revision: server.deploymentRevision,
+    value: { ...server.setup.machine },
+    writable: server.deploymentWritable,
+  }) },
+  'PUT deployment': { body: true, answer: ({ body }) => {
+    if (!server.deploymentWritable) return refuse(403, 'Deployment settings are read-only')
+    if (body.revision !== server.deploymentRevision) return refuse(409, 'Deployment settings changed. Reload before saving.')
+    const next = { ...server.setup.machine } as Record<string, unknown>
+    const editable = new Set(['promptMaxChars', 'admissionContextMaxPages', 'admissionContextTimeoutMs'])
+    for (const op of body.ops) {
+      const field = op.path[0]
+      if (!editable.has(field)) return refuse(400, `Field ${field} is not editable`)
+      if (op.op === 'set') next[field] = op.value
+      else delete next[field]
+    }
+    server.deploymentRevision++
+    server.setup = { ...server.setup, machine: next as SetupView['machine'] }
+    return { revision: server.deploymentRevision, value: { ...server.setup.machine }, writable: server.deploymentWritable }
+  } },
+  'GET sessions/:id/link': { answer: ({ params }) => {
+    const override = server.sessionLinks?.[params.id]
+    if (override === null) return refuse(404, 'Session not found')
+    if (override !== undefined) return { url: override }
+    return { url: `paseo://h/server-1/agent/${encodeURIComponent(params.id)}` }
+  } },
   'POST sources/:id/labels': { answer: () => {
     // Label refresh failures come from the bot CLI and are returned verbatim.
     if (server.joinError) return refuse(500, server.joinError)
@@ -369,9 +400,10 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET policy/history': { answer: () => server.history },
   'POST policy-sync/:id': { answer: ({ params }) => ({ policy: server.settings.policy.sources[params.id] }) },
   'POST setup/check': { answer: () => ({ restarting: true }) },
-  'GET models': { answer: () => ({ default: { provider: 'host', model: 'default' }, routableProviders: [], failures: [],
-    groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
-      reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
+  'GET models': { answer: () => ({ failures: [], profiles: [
+    { profileId: 'code-profile', name: 'Repository work', provider: 'codex', model: 'worker-model', modeId: 'full-access', thinkingOptionId: 'high', available: true },
+    { profileId: 'review-profile', name: 'Review', provider: 'pi', available: false },
+  ] }) },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts
@@ -440,6 +472,7 @@ export function usePanelServer(cleanup: () => void) {
       const method = init?.method ?? 'GET'
       const body: unknown = init?.body ? JSON.parse(String(init.body)) : undefined
       server.requests.push({ path: decodeURIComponent(`${path}${address.search}`), method, ...body === undefined ? {} : { body } })
+      server.headers.push(Object.fromEntries(new Headers(init?.headers).entries()))
       const route = match(method, path.split('/'))
       if (!route) return new Reply({ error: 'Unknown operation' }, 404)
       const answer = await run(route.key, route.params, address.searchParams, body)
@@ -452,29 +485,25 @@ export function usePanelServer(cleanup: () => void) {
   })
 }
 
-type Ops = Parameters<ConfigForm<Record<string, unknown>>['mutate']>[0]
-/** Fake DSH host configuration form that records mutations and optionally applies them to its snapshot. */
+/** Fake local deployment store that records mutations and optionally applies them to its snapshot. */
 export function fakeForm(writable = true, accept = true) {
   const listeners = new Set<() => void>()
-  let snapshot: ConfigFormSnapshot<Record<string, unknown>> = { status: 'ready', value: { ...MACHINE }, base: undefined, user: undefined,
-    revision: 1, writable,
-    mode: 'host' }
+  let snapshot: DeploymentSnapshot = { status: 'ready', value: { ...MACHINE }, revision: 1, writable }
   const notify = () => { for (const listener of listeners) listener() }
-  const mutations: { ops: Ops; revision: number | undefined }[] = []
-  const form: ConfigForm<Record<string, unknown>> = {
+  const mutations: { ops: DeploymentOp[]; revision: number | undefined }[] = []
+  const form: DeploymentStore = {
     getSnapshot: () => snapshot,
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener) } },
     mutate: async (ops, revision) => {
       mutations.push({ ops, revision })
       if (!accept || revision !== snapshot.revision) return false
-      const value = { ...snapshot.value }
+      const value = { ...snapshot.value } as Record<string, unknown>
       for (const op of ops) { if (op.op === 'set') value[op.path[0]!] = op.value; else delete value[op.path[0]!] }
-      snapshot = { ...snapshot, value, revision: snapshot.revision! + 1 }
+      snapshot = { ...snapshot, value: value as DeploymentSnapshot['value'], revision: snapshot.revision! + 1 }
       notify()
       return true
     },
-    set: async () => false, unset: async () => false,
   }
-  const publish = (patch: Partial<ConfigFormSnapshot<Record<string, unknown>>>) => { snapshot = { ...snapshot, ...patch }; notify() }
+  const publish = (patch: Partial<DeploymentSnapshot>) => { snapshot = { ...snapshot, ...patch }; notify() }
   return { form, mutations, publish }
 }

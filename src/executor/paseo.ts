@@ -1,8 +1,9 @@
 /** DSH executor: manages one persistent worker session and workspace directory per ticket. */
-import type { Context } from '@deepseek-ai/cordis'
-import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import { mkdir, rmdir, stat } from 'node:fs/promises'
+import type { Context } from '../runtime/context.ts'
+import type { SessionId } from '../runtime/types.ts'
+import type { Agent } from '../runtime/types.ts'
+import { mkdir, readdir, stat } from 'node:fs/promises'
+import { retireOwned } from '../infra/retention.ts'
 import { dirname, join } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
@@ -18,6 +19,7 @@ import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { ManagedProviderError } from '../runtime/failures.ts'
 
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
@@ -38,7 +40,7 @@ const SLOT_WAIT_MS = 5000
 const fromPerson = (input?: TicketInput): boolean => input?.kind === 'trigger' ? !!input.human && !input.context : input?.kind === 'text'
 /**
  * Internal error thrown when a ticket's workspace prepare command fails during launch.
- * DshExecutor catches it to mark the ticket failed immediately rather than retrying automatically, because an existing directory counts as prepared and an automatic retry would treat whatever a failed prepare command left behind in the directory as a prepared workspace.
+ * PaseoExecutor catches it to mark the ticket failed immediately rather than retrying automatically, because an existing directory counts as prepared and an automatic retry would treat whatever a failed prepare command left behind in the directory as a prepared workspace.
  */
 class PrepareFailed extends Error {}
 const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR', 'socket hang up', 'fetch failed',
@@ -48,6 +50,7 @@ const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAI
  * connection that was refused, reset, timed out, or could not resolve its host.
  */
 export function transient(error: unknown): boolean {
+  if (error instanceof ManagedProviderError) return error.retryable
   const status = (error as { status?: unknown } | undefined)?.status
   if (typeof status === 'number') return status === 408 || status === 429 || status >= 500
   const text = error instanceof Error ? `${error.name} ${error.message} ${String((error as { code?: unknown }).code ?? '')}` : String(error)
@@ -55,7 +58,7 @@ export function transient(error: unknown): boolean {
 }
 /** Appends a stable 12-character ticket ID suffix to a validated English worktree name. */
 const ticketWorktreeName = (name: string, id: string): string => `${WorktreeNameSchema.parse(name)}-${id.slice(0, 12)}`
-/** Host dependencies used by `DshExecutor`. */
+/** Host dependencies used by `PaseoExecutor`. */
 export interface ExecutorHost {
   /** DSH Cordis context: agents and their events, and the subprocess service used to run prepare commands. */
   readonly context: Context
@@ -85,13 +88,21 @@ export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: 
   host.store.triggers.get(ticket.origin.triggerId)
 
 /**
- * Returns additional system-prompt mandate instructions for a worker beyond the request: for work accepted proactively under
- * rules (`strength === 'inferred'`), restricts authorization to small internal changes within the rule scope; returns `''` for explicit requests.
+ * Returns the worker's authorization limits. The confirmed Paseo plan rule permits the user's confirmed scope;
+ * other inferred work stays limited to a small internal change, while explicit requests need no additional limit here.
  */
-export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string {
-  return mandate.strength === 'inferred' ? 'This ticket has limited proactive authorization. Independently verify that it is a small change '
+export function mandateInstructions(mandate: Pick<Mandate, 'strength'> & Partial<Pick<Mandate, 'basis' | 'actor'>>): string {
+  if (mandate.strength !== 'inferred') return ''
+  if (mandate.basis?.source === 'paseo' && mandate.basis.via !== 'bot' && mandate.actor?.source === 'paseo'
+    && mandate.actor.id === 'operator' && mandate.basis.rules?.includes('confirmed-paseo-plan')) {
+    return 'This Paseo ticket was accepted under confirmed-paseo-plan. Independently verify that the source conversation contains the user’s '
+      + 'explicit confirmation of a concrete plan and that the originating request asks to implement or repeat it. Within the accepted '
+      + 'and confirmed scope, public behavior, configuration and multiple modules may change as necessary. Do not infer additional product '
+      + 'decisions or expand scope. If confirmation, scope or direction cannot be verified, stop and report dropped.'
+  }
+  return 'This ticket has limited proactive authorization. Independently verify that it is a small change '
     + 'internal to one module within the accepted rule scope. If it requires public-interface or behavior changes, new interaction, product '
-    + 'decisions or clarification, stop and report dropped; do not expand scope.' : ''
+    + 'decisions or clarification, stop and report dropped; do not expand scope.'
 }
 /** Builds a newly accepted ticket's Execution metadata: its worktree name, workspace directory, and assignment text. */
 export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, settings: Settings,
@@ -121,6 +132,9 @@ const capped = (text: string, limit: number, read: string) =>
 export function triggerMessage(trigger: Trigger, link: { source_url?: string; source_url_read?: string }, note?: string, repliesTo?: Trigger) {
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
     ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
+    ...(trigger.source === 'paseo' ? { reply_available: !!trigger.channel, conversation: trigger.meta.context ?? [],
+      ...(typeof trigger.meta.answerToQuestion === 'string' ? { answering: { ticket_id: trigger.meta.answerToTicket,
+        question: trigger.meta.answerToQuestion } } : {}) } : {}),
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }
 /** Formats a peer trigger from the ticket's acceptance batch with author, timestamp, 160-character preview, and read resource path. */
@@ -165,14 +179,14 @@ export function inputMessage(input: TicketInput, trigger?: object): string | und
 /**
  * Tracks active and starting worker sessions against the configured concurrency limit: a ticket holds a slot while its
  * worker's turn runs, while its shell jobs or subagents run after that turn ended, and while a launch or wake starts that worker.
- * DshExecutor reserves slots synchronously before awaiting launch or wake work so two starts cannot take the last slot,
+ * PaseoExecutor reserves slots synchronously before awaiting launch or wake work so two starts cannot take the last slot,
  * and allows one extra slot beyond the limit for human follow-ups (`by === 'person'`) so they never wait behind new launches.
  */
 export class WorkerSlots {
   /** Tickets currently holding a startup slot, mapped to whether the start is a launch, a wake, or a wake for a person's message. */
   private readonly starting = new Map<string, 'launch' | 'wake' | 'person'>()
   /**
-   * @param running - Returns the ticket IDs whose worker holds a slot (see `DshExecutor.running`).
+   * @param running - Returns the ticket IDs whose worker holds a slot (see `PaseoExecutor.running`).
    * @param max - Returns the configured maximum number of concurrent worker slots.
    */
   constructor(private readonly running: () => string[], private readonly max: () => number) {}
@@ -204,7 +218,7 @@ export class WorkerSlots {
  * `agent/inbox/claimed`, `session/event` and `agent/error` events on the Cordis context, and reports status transitions back to Engine.
  * Runtime, Engine, worker tools, and management routes use this class to prepare, launch, deliver to, stop, and resume ticket assignments.
  */
-export class DshExecutor implements Executor {
+export class PaseoExecutor implements Executor {
   private readonly disposers: (() => void)[] = []
   private readonly slots: WorkerSlots
   /** Transient failure counts tried so far: keyed by `assignment.id` for worker turns and `launch:<assignment.id>` for launches. */
@@ -254,7 +268,7 @@ export class DshExecutor implements Executor {
     if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
       .catch(async (error: unknown) => {
         // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
-        await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
+        if (await readdir(directory).then(files => files.length === 0, () => false)) await retireOwned(directory, join(this.host.machine.stateDir, 'failed-prepares'))
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
       })
     await mkdir(directory, { recursive: true })
@@ -431,6 +445,9 @@ export class DshExecutor implements Executor {
     const source = sourceTrigger(this.host, ticket)
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
+    // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
+    await this.stopped(ticket.id)
+    if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
     if (!await stat(workspace).then(() => true, () => false)) {
       await this.prepareDirectory(ticket)
@@ -439,9 +456,6 @@ export class DshExecutor implements Executor {
     if (!current()) return
     const sessionId = workerSessionId(ticket.id)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
-    if (!current()) return
-    // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
-    await this.stopped(ticket.id)
     if (!current()) return
     // A message put back for this Assignment may still wait in the Session, kept by a restart's cancel or persisted across a
     // crash, where this launch's message would take it into a step beside the copy delivered next: that copy is the only one.
@@ -526,6 +540,11 @@ export class DshExecutor implements Executor {
     for (const ticket of this.host.store.tickets.open().sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
       const running = runningAssignment(ticket), latest = latestAssignment(ticket)
       if (running) {
+        if (this.host.context.runtime?.binding(workerSessionId(ticket.id)).handedBack) {
+          const agent = this.host.context.agents.get(workerSessionId(ticket.id))
+          if (agent) this.handOff(ticket.id, agent)
+          continue
+        }
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
         // Input that was handed over but not yet taken.
         this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.cancel({ kind: 'user' }, { keepInbox: true })
@@ -586,6 +605,7 @@ export class DshExecutor implements Executor {
    * collected, so none wakes the worker outside a slot, and the worker reads of each at its next turn.
    */
   private handOff(ticketId: string, agent: Agent): void {
+    this.host.context.runtime?.handoff(agent.id)
     this.track(ticketId, stopSubagents(this.host.context, agent, true))
     const left = this.left.get(ticketId) ?? { jobs: new Set<string>(), collect: new AbortController() }
     this.left.set(ticketId, left)

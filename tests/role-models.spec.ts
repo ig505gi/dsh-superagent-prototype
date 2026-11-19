@@ -1,65 +1,34 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { Context } from '@deepseek-ai/cordis'
-import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import { agentEvents, installModelSelection, type Agent, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { initializeRoleModel } from '../src/app/role-models.ts'
-const contexts: Context[] = []
-afterEach(async () => { await Promise.all(contexts.splice(0).map(ctx => ctx.fiber.dispose())); vi.restoreAllMocks() })
-async function fixture() {
-  const ctx = new Context(); contexts.push(ctx); await ctx.plugin(SystemPrompt)
-  const resolve = vi.fn(async value => value)
-  const flush = vi.fn(async () => {})
-  ctx.reflect.provide('llm', { resolveCallConfig: resolve })
-  ctx.reflect.provide('sessionPersistence', { flush })
-  const session = Session.create(SessionId('role-model'))
-  const agent = { ctx, session } as Agent
-  const host: ModelSelectionRef = { get current() { return session.requestHeader()?.config ?? { provider: 'host', model: 'default', reasoningEffort: ReasoningEffortId('high') } }, assembled: undefined }
-  installModelSelection(ctx, host)
-  const request = () => agentEvents(ctx, agent).waterfall('agent/request', { turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ provider: 'seed', model: 'seed' }))
-  const record = (selection: ModelSelection) => { const event = session.append('request/header', { header: { config: selection }, reason: 'initial' }); ctx.emit('session/event', session, event) }
-  return { ctx, agent, host, resolve, flush, request, record }
-}
-it('keeps prompt variables and initial routing on the role model without saving the host default', async () => {
-  const { ctx, agent, request, record, flush } = await fixture()
-  await initializeRoleModel(ctx, agent, { provider: 'worker-provider', model: 'worker-model' })
-  expect((await ctx.systemPrompt.assemble()).variables).toMatchObject({ provider: 'worker-provider', model: 'worker-model' })
-  const selected = await request()
-  expect(selected).toEqual({ provider: 'worker-provider', model: 'worker-model' })
-  expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(true)
-  expect(flush).toHaveBeenCalledOnce()
-  record(selected)
-  // A retry of the same assembled step keeps the same model even after the header is persisted.
-  expect(await request()).toEqual(selected)
-  await ctx.systemPrompt.assemble()
-  expect(await request()).toEqual(selected)
+import { resolveRoleModel } from '../src/app/role-models.ts'
+import { assessorProfile, executorProfile, managedFixture, type ManagedFixture } from './fixtures/paseo-runtime.ts'
+import { trashSync } from './fixtures/trash.ts'
+
+let fixture: ManagedFixture | undefined
+afterEach(async () => {
+  if (fixture) { await fixture.close(); trashSync(fixture.root); fixture = undefined }
+  vi.restoreAllMocks()
 })
-it('lets a later explicit selection win without changing the in-flight assembled step', async () => {
-  const { ctx, agent, host, request } = await fixture()
-  await initializeRoleModel(ctx, agent, { provider: 'worker', model: 'one' })
-  await ctx.systemPrompt.assemble()
-  const manual = { provider: 'manual', model: 'two', reasoningEffort: ReasoningEffortId('low') }
-  Object.defineProperty(host, 'current', { value: manual, configurable: true })
-  const event = agent.session.append('model/selection', manual); ctx.emit('session/event', agent.session, event)
-  expect(await request()).toEqual({ provider: 'worker', model: 'one' })
-  await ctx.systemPrompt.assemble()
-  expect(await request()).toEqual(manual)
+
+it('reads Pi and Codex profiles and reports unavailable providers without a fallback', async () => {
+  const { adapter, daemon } = fixture = await managedFixture()
+  const offline = { profileId: 'offline', name: 'Offline', provider: 'factory-droid' }
+  daemon.profiles.push(offline)
+  const catalog = await adapter.modelCatalog()
+  expect(catalog).toMatchObject({ profiles: [
+    { ...assessorProfile, available: true }, { ...executorProfile, available: true }, { ...offline, available: false },
+  ], failures: [] })
+  await expect(resolveRoleModel(adapter.context, assessorProfile.profileId)).resolves.toEqual(assessorProfile)
+  await expect(resolveRoleModel(adapter.context, executorProfile.profileId)).resolves.toEqual(executorProfile)
+  await expect(resolveRoleModel(adapter.context, offline.profileId)).rejects.toThrow('Choose an available profile')
 })
-it.each(['header', 'selection'])('preserves a resumed Session with existing %s', async kind => {
-  const { ctx, agent, resolve } = await fixture()
-  const existing = { provider: 'existing', model: 'keep' }
-  if (kind === 'header') agent.session.append('request/header', { header: { config: existing }, reason: 'initial' })
-  else agent.session.append('model/selection', existing)
-  await initializeRoleModel(ctx, agent, { provider: 'worker', model: 'new' })
-  expect(resolve).not.toHaveBeenCalled()
-})
-it('inherits the host when unset and fails unavailable routes before recording a selection', async () => {
-  const { ctx, agent, resolve, request } = await fixture()
-  await initializeRoleModel(ctx, agent, null)
-  await ctx.systemPrompt.assemble()
-  expect(await request()).toMatchObject({ provider: 'host', model: 'default' })
-  resolve.mockRejectedValueOnce(new Error('unknown provider'))
-  await expect(initializeRoleModel(ctx, agent, { provider: 'unknown', model: 'x' })).rejects.toThrow('unknown provider')
-  expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
+
+it('keeps a catalog failure readable and omits malformed or blank launch fields', async () => {
+  const { adapter, daemon } = fixture = await managedFixture()
+  daemon.profiles = [{ ...assessorProfile, model: '', modeId: '', thinkingOptionId: ' ' }, { ...executorProfile, name: '' }]
+  vi.spyOn(daemon.client, 'listAvailableProviders').mockRejectedValue(new Error('transport details'))
+  const catalog = await adapter.modelCatalog()
+  expect(JSON.parse(JSON.stringify(catalog.profiles))).toEqual([{ profileId: assessorProfile.profileId, name: assessorProfile.name,
+    provider: assessorProfile.provider, available: false }])
+  expect(catalog.failures).toMatchObject([{ id: 'providers' }])
+  expect(JSON.stringify(catalog)).not.toContain('transport details')
 })

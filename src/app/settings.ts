@@ -1,5 +1,5 @@
 /** Block-scoped settings validation, optimistic concurrency saves, processing pause control, and source policy synchronization. */
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context } from '../runtime/context.ts'
 import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
@@ -71,6 +71,7 @@ export interface SettingsHost {
   readonly setup: Pick<Setup, 'configured' | 'checkAccounts' | 'blockCommands' | 'restart'>
   /** Triggers an immediate pass so work newly allowed by a settings save runs right away. */
   requestPass(): void
+  refreshMainSession?(): void
 }
 
 /**
@@ -154,14 +155,14 @@ export class Settings {
     if (!(kind in BLOCKS)) throw new UserError('unknownBlock', { block })
     const rules = BLOCKS[kind as keyof typeof BLOCKS]
     if (kind === 'source' && !sources.kind(id)) throw new UserError('sourceNotInstalled', { source: id })
-    const parsed = rules.parse(value, sources, id)
+    let parsed = rules.parse(value, sources, id)
     const current = store.settings()
     const candidate = rules.merge(current, parsed, id)
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
     if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
-      try { await resolveRoleModel(this.host.context, model) }
-      catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
+      try { parsed = { ...candidate[block === 'eval' ? 'eval' : 'executor'], model: await resolveRoleModel(this.host.context, model.profileId) } }
+      catch (error) { throw new UserError('profileUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
     rules.guard?.(current, candidate, origin)
     if (setupChanged(current, candidate)) await this.host.setup.checkAccounts(block, candidate)
@@ -169,11 +170,14 @@ export class Settings {
     // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
     const old = store.settings()
     const settings = rules.merge(old, parsed, id)
+    const refreshMain = block === 'eval' && model ? this.host.refreshMainSession : undefined
     if (JSON.stringify(SettingsSchema.parse(settings)) === JSON.stringify(old)) {
+      refreshMain?.()
       const delivery = await sessions.delivery(`settings:${block}`)
       return { saved: true, revision: store.blockRevision(block), policy_changed: false, restarting: false, context_delivery: delivery }
     }
-    const restarting = setupChanged(old, settings) || !this.host.setup.configured()
+    const clearedProfile = this.host.context.runtime && (previous && !model)
+    const restarting = setupChanged(old, settings) || !this.host.setup.configured() || !!clearedProfile
     const before = policyVersion(old), after = policyVersion(settings)
     const scope = (version: SettingsValue) => ({
       scope: (input: { source: string; meta: Record<string, unknown> }) => this.host.sources.scope(input, version) })
@@ -189,9 +193,13 @@ export class Settings {
     const changed = blocked.join(' ') !== old.executor.blockedCommands.join(' ')
     if (changed) await this.host.setup.blockCommands(blocked)
     // When restarting, the notice stays pending until after the restart; `setup.restart()` defers until this call returns.
-    const delivery = restarting ? 'pending' : await sessions.delivery(`settings:${block}`)
+    const switchingMain = refreshMain && JSON.stringify(old.eval.model) !== JSON.stringify(settings.eval.model)
+    const delivery = restarting || switchingMain ? 'pending' : await sessions.delivery(`settings:${block}`)
     if (restarting) this.host.setup.restart()
-    else this.host.requestPass()
+    else {
+      refreshMain?.()
+      this.host.requestPass()
+    }
     return { saved: true, revision: store.blockRevision(block), policy_changed: before !== after, restarting, context_delivery: delivery }
   }
   /**

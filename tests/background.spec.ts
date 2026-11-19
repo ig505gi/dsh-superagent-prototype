@@ -1,6 +1,6 @@
 /** A worker's background work in DSH: waiting for its shell jobs and subagents, and stopping them. */
-import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Context } from '../src/runtime/context.ts'
+import type { Agent } from '../src/runtime/types.ts'
 import { expect, it, vi } from 'vitest'
 import { stopSubagents, untilQuiet } from '../src/executor/background.ts'
 import { jobRegistry } from './fixtures/host.ts'

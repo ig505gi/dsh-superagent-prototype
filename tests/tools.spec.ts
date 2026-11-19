@@ -44,10 +44,10 @@ it('reads the lists, a ticket, a decision, the settings, the prompts and the mod
   await expect(read('settings/source:retired')).rejects.toThrow('Unknown settings block')
   const skills = { built_in: ['dsh-superagent-feishu', 'dsh-superagent-github'], team: [] }
   expect(await read('prompts')).toMatchObject({ revision: 0, read: 'prompts/0', skills, items: [expect.objectContaining({ revision: 0 })], next_offset: null })
-  const models = [{ id: 'm1', name: 'One' }, { id: 'm2', name: 'Two' }]
-  const catalog = { default: { provider: 'p', model: 'm1' }, groups: [{ id: 'p', name: 'Provider', models }], failures: [] }
+  const models = [{ profileId: 'p1', name: 'One', provider: 'p', available: true }, { profileId: 'p2', name: 'Two', provider: 'p', available: true }]
+  const catalog = { profiles: models, failures: [] }
   Object.assign(h.controller, { modelCatalog: vi.fn(async () => catalog) })
-  expect(await read('models')).toMatchObject({ providers: [{ id: 'p', count: 2, read: 'models/p' }], roles: expect.any(Object) })
+  expect(await read('models')).toMatchObject({ profiles: models, roles: expect.any(Object) })
   expect(await read('models/p', { limit: 1 })).toEqual({ items: [models[0]], next_offset: 1 })
   await expect(read('ticket')).rejects.toThrow('Unknown context resource')
   // A list page holds at most 50 items, the prompt history too.

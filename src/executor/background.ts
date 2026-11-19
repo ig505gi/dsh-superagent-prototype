@@ -2,9 +2,9 @@
  * A worker's background work in DSH: the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`). They
  * keep the worker busy after its turn ended, and they stop with its Assignment. A profile without either service has none.
  */
-import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Context } from '../runtime/context.ts'
+import type { Agent } from '../runtime/types.ts'
+import type { SessionId } from '../runtime/types.ts'
 
 /** What the Executor uses of DSH's job registry: the jobs a Session can see, their events, a wait for one and a kill. */
 interface Jobs {

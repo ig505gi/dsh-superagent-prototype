@@ -1,7 +1,7 @@
-import { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId, SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { Context } from '../src/runtime/context.ts'
+import type { Agent } from '../src/runtime/types.ts'
+import { createUserMessage, type UserMessage } from '../src/runtime/types.ts'
+import { SessionId, SessionSeq, type SessionEvent } from '../src/runtime/types.ts'
 import { expect, it, vi } from 'vitest'
 import { AgentDelivery } from '../src/app/delivery.ts'
 

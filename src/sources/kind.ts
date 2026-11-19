@@ -1,5 +1,5 @@
 /** SourceKind plugin contract: configuration schema, UI form fields, policy integration, channel adapter, and thread context reader. */
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent } from '../runtime/types.ts'
 import type { z } from 'zod'
 import type { OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'

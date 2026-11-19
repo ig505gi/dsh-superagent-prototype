@@ -1,12 +1,18 @@
 /** Localization, reason formatting, message marker cleanup, and relative timestamp helpers. */
-import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
 import type { DshSuperagentKey } from './locales.ts'
 import type { Localized } from '../sources/kind.ts'
 import type { SetupProblem } from '../setup.ts'
 import type { Health } from '../sources/host.ts'
 import { reasonText, type Reason } from '../core/reasons.ts'
 
+export type Translate<K extends string = string> = (key: K, params?: Record<string, unknown>) => string
 export type T = Translate<DshSuperagentKey>
+export function createTranslator(dictionary: Record<DshSuperagentKey, string>): T {
+  return (key, params) => {
+    const template = dictionary[key] ?? key
+    return params ? template.replace(/\{(\w+)\}/g, (match, name: string) => name in params ? String(params[name]) : match) : template
+  }
+}
 export const errorText = (failure: unknown): string => failure instanceof Error ? failure.message : String(failure)
 export const localized = (t: T, text: Localized | string | undefined): string =>
   typeof text === 'string' ? text : text ? text[t('lang') === 'en' ? 'en' : 'zh'] : ''

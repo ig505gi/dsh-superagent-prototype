@@ -1,9 +1,10 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { trashSync } from './fixtures/trash.ts'
+import { mkdtempSync } from 'node:fs'
 import { writeFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import { Context } from '../src/runtime/context.ts'
+import type { Agent } from '../src/runtime/types.ts'
 import { afterEach, beforeEach, expect, it, vi, type MockInstance } from 'vitest'
 import { Commands } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -35,7 +36,7 @@ beforeEach(() => {
     return { saved_path }
   })
 })
-afterEach(() => { vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
+afterEach(() => { vi.restoreAllMocks(); trashSync(directory, { recursive: true, force: true }) })
 it('retains the source-message pairing, commits an image reference and removes temporary files', async () => {
   expect(admissionImageKeys('![Image](img_source) {"image_key":"img_second"} img_source')).toEqual(['img_source', 'img_second'])
   expect(await readAdmissionImage(agent, commands, source, text, 'img_source', directory, signal())).toEqual({ source_message_id: 'om_source', image_key: 'img_source', image: ref })

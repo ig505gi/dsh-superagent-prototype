@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
-import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
+import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/paseo.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { deferred, waitUntil } from './fixtures/async.ts'
@@ -27,6 +27,79 @@ const idle = (sessionId: string) => {
   agent.status = 'idle'
   h.ctx.emit('agent/status', { agent, status: 'idle' } as never)
 }
+
+describe('assignment launch waits for previous owned work cleanup', () => {
+  async function heldCleanup() {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const job = h.jobs.run(one.sessionId), child = h.subagents.spawn(one.sessionId)
+    const release = deferred(), childEntered = deferred(), ensure = vi.spyOn(h.runtime.sessions, 'ensure')
+    h.jobs.service.kill.mockImplementationOnce(() => 'requested')
+    const drain = h.subagents.service.drainChildren.getMockImplementation()!
+    h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => {
+      childEntered.resolve(); await release.promise; await drain(parent, ids)
+    })
+    const businessSends = () => h.deliveries.mock.calls.filter(([call]) => call.sessionId === one.sessionId && call.id.startsWith('dsh-superagent:')).length
+    const before = businessSends(), stopped = vi.spyOn(h.runtime.executor as unknown as { stopped(id: string): Promise<void> }, 'stopped')
+    let releasedJob = false
+    const releaseJob = () => {
+      if (releasedJob) return
+      releasedJob = true
+      if (h.jobs.service.list(one.sessionId).some(row => row.id === job && ['running', 'stopping'].includes(row.status))) h.jobs.end(job, 'killed')
+    }
+    h.runtime.executor.resume()
+    const pumping = h.runtime.pump()
+    await waitUntil(() => h.jobs.service.wait.mock.calls.some(([id]) => id === job))
+    await waitUntil(() => stopped.mock.calls.some(([id]) => id === one.ticket.id))
+    return { ...one, child, ensure, before, businessSends, releaseJob, childEntered, release,
+      finish: async () => { releaseJob(); release.resolve(); await pumping; await h.runtime.idle() } }
+  }
+
+  it('does not ensure or send while the old shell or child cleanup is unfinished', async () => {
+    const held = await heldCleanup()
+    try {
+      expect(held.ensure.mock.calls.filter(([id]) => id === held.sessionId)).toHaveLength(0)
+      expect(held.businessSends()).toBe(held.before)
+      held.releaseJob(); await held.childEntered.promise
+      expect(held.ensure.mock.calls.filter(([id]) => id === held.sessionId)).toHaveLength(0)
+      expect(latestAssignment(h.runtime.store.tickets.get(held.ticket.id)!)?.report).toBeUndefined()
+      expect(held.businessSends()).toBe(held.before)
+      await held.finish()
+      expect(latestAssignment(h.runtime.store.tickets.get(held.ticket.id)!)).toMatchObject({ state: 'running' })
+      expect(held.ensure.mock.calls.filter(([id]) => id === held.sessionId)).toHaveLength(1)
+      expect(h.subagents.live(held.child)).toBe(false)
+    } finally { await held.finish() }
+  })
+
+  it.each(['pause', 'closing', 'stop', 'replacement'] as const)('rechecks %s after old work cleanup before ensuring or sending', async action => {
+    const held = await heldCleanup()
+    let restoreClosing: (() => void) | undefined
+    try {
+      if (action === 'pause') await h.runtime.settings.pause(true, 'panel')
+      else if (action === 'closing') {
+        const closing = vi.spyOn(h.runtime as unknown as { closing(): boolean }, 'closing').mockReturnValue(true)
+        restoreClosing = () => { closing.mockRestore() }
+      }
+      else if (action === 'stop') h.runtime.engine.stopTicket(held.ticket.id)
+      else {
+        // Another transaction has replaced the pending window while this launch waits for its predecessor.
+        const ticket = h.runtime.store.tickets.get(held.ticket.id)!, previous = latestAssignment(ticket)!, at = new Date().toISOString()
+        h.runtime.store.tickets.save({ ...ticket, assignments: [...ticket.assignments.slice(0, -1),
+          { ...previous, state: 'ended', endedAt: at, endedReason: 'retried' },
+          { id: `replacement-${previous.id}`, state: 'pending', createdAt: at }] })
+      }
+      await held.finish()
+      expect(held.ensure.mock.calls.filter(([id]) => id === held.sessionId)).toHaveLength(0)
+      expect(held.businessSends()).toBe(held.before)
+      expect(h.runtime.store.tickets.get(held.ticket.id)!.assignments.every(assignment => assignment.report?.state !== 'failed')).toBe(true)
+      if (action === 'pause') {
+        expect(h.runtime.effects.pending('launch')).toBe(true)
+        vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+        try { await h.runtime.settings.pause(false, 'panel'); await h.runtime.idle() } finally { vi.useRealTimers() }
+        expect(latestAssignment(h.runtime.store.tickets.get(held.ticket.id)!)).toMatchObject({ state: 'running' })
+      }
+    } finally { restoreClosing?.(); await held.finish() }
+  })
+})
 
 it('evaluates a message that arrives on a thread while an earlier candidate\'s card waits for its link, in the thread\'s next Eval', async () => {
   const gate = deferred()
@@ -900,6 +973,27 @@ describe('the Executor\'s parts', () => {
     expect(execution.assignment).not.toContain(mandateInstructions(ticket.mandate))
     expect(execution.assignment).toContain('- Copy fixes (copy): Fix typos only.')
     expect(mandateInstructions({ strength: 'explicit' })).toBe('')
+  })
+  it('allows only a confirmed Paseo plan to exceed the usual inferred-work limits', () => {
+    const mandate: Ticket['mandate'] = { strength: 'inferred', policyVersion: 'v1', scope: 'the confirmed plan',
+      basis: { source: 'paseo', via: 'admission', cell: 'listedUnaddressed', rules: ['agreed-internal-work', 'confirmed-paseo-plan'] },
+      actor: { source: 'paseo', id: 'operator' } }
+    const confirmed = mandateInstructions(mandate)
+    expect(confirmed).toContain('explicit confirmation of a concrete plan')
+    expect(confirmed).toContain('originating request asks to implement or repeat it')
+    expect(confirmed).toContain('public behavior, configuration and multiple modules may change')
+    expect(confirmed).toContain('If confirmation, scope or direction cannot be verified, stop and report dropped')
+    expect(confirmed).not.toContain('internal to one module')
+
+    const restricted = [
+      { ...mandate, basis: { ...mandate.basis, rules: ['agreed-internal-work'] } },
+      { ...mandate, basis: { ...mandate.basis, source: 'feishu' } },
+      { ...mandate, actor: { source: 'feishu', id: 'operator' } },
+      { ...mandate, actor: { source: 'paseo', id: 'someone-else' } },
+      { ...mandate, basis: { ...mandate.basis, via: 'bot' as const, observation: { mode: 'auto' as const } } },
+    ]
+    for (const other of restricted) expect(mandateInstructions(other)).toContain('internal to one module')
+    expect(mandateInstructions({ ...mandate, strength: 'explicit' })).toBe('')
   })
   it('renders each kind of Input as its worker reads it, inline, and no reopen Input', () => {
     const asked = { id: 'tr1', source: 'feishu', threads: [{ source: 'feishu', id: 'oc:om_1' }], actor: { source: 'feishu', id: 'ou_a' }, human: true,

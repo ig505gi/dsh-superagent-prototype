@@ -2,31 +2,30 @@
 import { LIMITS } from './limits.ts'
 import { accessSync, constants, statSync } from 'node:fs'
 import { delimiter, isAbsolute, join } from 'node:path'
-import type { Volatile } from '@deepseek-ai/cordis'
-import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
-import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import type { SubprocessRuntime } from './runtime/types.ts'
 import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
-const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
-/** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
-export const Config = s.object({
-  stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
-  promptMaxChars: s.number().min(LIMITS.promptMaxChars.min).max(LIMITS.promptMaxChars.max).step(1).default(100000)
-    .description('Largest saved prompt configuration, in characters.').volatile(),
-  admissionContextMaxPages: s.number().min(LIMITS.admissionContextMaxPages.min).max(LIMITS.admissionContextMaxPages.max).step(1).default(10)
-    .description('Pages of thread context one assessment may read.').volatile(),
-  admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
-    .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
-})
-export type DeploymentConfig = ReturnType<typeof Config>
+const machineSchema = z.object({
+  stateDir: z.string().regex(/^\//),
+  promptMaxChars: z.number().int().min(LIMITS.promptMaxChars.min).max(LIMITS.promptMaxChars.max).default(100000),
+  admissionContextMaxPages: z.number().int().min(LIMITS.admissionContextMaxPages.min).max(LIMITS.admissionContextMaxPages.max).default(10),
+  admissionContextTimeoutMs: z.number().int().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).default(15000),
+}).passthrough()
+/** Parse machine limits without depending on a host configuration framework. */
+export const Config = Object.assign((input: unknown): DeploymentConfig => {
+  const value = machineSchema.parse(input)
+  return { ...value, promptMaxChars: { get: () => value.promptMaxChars }, admissionContextMaxPages: { get: () => value.admissionContextMaxPages },
+    admissionContextTimeoutMs: { get: () => value.admissionContextTimeoutMs } }
+}, { dict: machineSchema.shape })
+export type DeploymentConfig = Machine & Record<string, unknown>
 export interface Machine {
   stateDir: string
-  promptMaxChars: Volatile<number>
-  admissionContextMaxPages: Volatile<number>
-  admissionContextTimeoutMs: Volatile<number>
+  promptMaxChars: { get(): number }
+  admissionContextMaxPages: { get(): number }
+  admissionContextTimeoutMs: { get(): number }
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
@@ -46,13 +45,31 @@ export const GithubAccountsSchema = z.object({
   repository: z.string().trim().regex(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/, 'owner/name').default(''),
   cli: z.string().trim().default(''),
 })
+export const GitlabProjectSchema = z.object({
+  host: z.string().trim().regex(/^([A-Za-z0-9.-]+(:\d{1,5})?)?$/, 'gitlab.example.com').default(''),
+  project: z.string().trim().regex(/^([A-Za-z0-9_.\-/]+)?$/, 'group/project').default(''),
+  cli: z.string().trim().default(''),
+})
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape),
+  gitlab: Object.keys(GitlabProjectSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+
+/** The code host a deployment acts on; its CLI is the account the agent comments, pushes and opens merges as. */
+export type ForgeKind = 'github' | 'gitlab'
+export interface Forge {
+  kind: ForgeKind
+  /** Host name without a scheme, such as `github.com` or `gitlab.example.com`: git credentials and links are keyed by it. */
+  host: string
+  cli: string
+  login: string
+  noreply: string
+}
 
 export interface Deployment extends Machine {
+  /** The repository on the forge: `owner/name`, or a GitLab project path such as `group/sub/project`. */
   repository: string
-  github: { cli: string; login: string; noreply: string }
+  forge: Forge
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
@@ -84,7 +101,7 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   return result.success ? result.data : undefined
 }
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+export async function resolveGithub(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
@@ -102,7 +119,59 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  return { ...machine, repository, forge: { kind: 'github', host: 'github.com', cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+}
+
+/** The host name of an instance address, without the port it may be served on (`gitlab.example.com:8443`). */
+export const hostnameOf = (host: string): string => host.replace(/:\d+$/, '')
+/** The GitLab instance fields, in the shape `glab api` reports them. */
+const GitlabUser = z.object({ id: z.number().int().positive(), username: z.string().min(1), email: z.string().optional() })
+const GitlabProject = z.object({ path_with_namespace: z.string().min(1),
+  permissions: z.object({ project_access: z.object({ access_level: z.number().int() }).nullish(),
+    group_access: z.object({ access_level: z.number().int() }).nullish() }).nullish() })
+/** Developer and above may push; GitLab reports Guest as 10, Reporter as 20 and Developer as 30. */
+const MAY_PUSH = 30
+/**
+ * Verify the agent's GitLab CLI identity and push access to the configured project on a self-hosted instance.
+ * `project` is a full path such as `group/sub/project`, which the API addresses in its URL-encoded form.
+ */
+export async function resolveGitlab(machine: Machine, gitlab: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  const { stateDir } = machine
+  const account = GitlabProjectSchema.parse(gitlab ?? {})
+  if (!account.host) throw new SetupError('gitlabHostUnset')
+  if (!account.project) throw new SetupError('projectUnset')
+  if (!account.cli) throw new SetupError('gitlabCliUnset')
+  let cli: string
+  try { cli = executable(account.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('gitlabCliMissing', { output: reason(error) }) }
+  const text = await probe([cli, 'api', 'user', '--hostname', account.host]).catch((error: unknown) => { throw new SetupError('gitlabCliSignedOut', { output: reason(error) }) })
+  const agent = parsed(GitlabUser, text)
+  if (!agent) throw new SetupError('gitlabCliNoAccount')
+  const id = encodeURIComponent(account.project)
+  const access = parsed(GitlabProject, await probe([cli, 'api', `projects/${id}`, '--hostname', account.host]).catch((error: unknown) => {
+    throw new SetupError('projectUnreadable', { account: agent.username, repository: account.project, output: reason(error) })
+  }))
+  if (!access) throw new SetupError('projectUnreported', { repository: account.project })
+  const repository = access.path_with_namespace
+  // A project without either permission block is one the agent can read but not push to; GitLab omits them for outsiders.
+  const level = Math.max(access.permissions?.project_access?.access_level ?? 0, access.permissions?.group_access?.access_level ?? 0)
+  if (level < MAY_PUSH) throw new SetupError('projectReadOnly', { account: agent.username, repository })
+  // A commit address needs a domain, not a port: an instance served on one keeps it in `host` alone.
+  const noreply = agent.email || `${agent.username}@users.noreply.${hostnameOf(account.host)}`
+  return { ...machine, repository, forge: { kind: 'gitlab', host: account.host, cli, login: agent.username, noreply } }
+}
+
+/**
+ * Resolve the deployment's forge from the Source blocks: GitHub when its repository is set, GitLab when its instance or
+ * project is, and one of them only. Machine limits apply to both.
+ */
+export async function resolveDeployment(machine: Machine, sources: { github?: unknown; gitlab?: unknown }, probe: Probe,
+  path = process.env.PATH ?? ''): Promise<Deployment> {
+  const github = GithubAccountsSchema.parse(sources.github ?? {})
+  const gitlab = GitlabProjectSchema.parse(sources.gitlab ?? {})
+  const wantsGithub = !!github.repository
+  const wantsGitlab = !!gitlab.host || !!gitlab.project
+  if (wantsGithub && wantsGitlab) throw new SetupError('forgeAmbiguous')
+  return wantsGitlab ? await resolveGitlab(machine, gitlab, probe, path) : await resolveGithub(machine, github, probe, path)
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

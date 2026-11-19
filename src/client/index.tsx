@@ -1,58 +1,128 @@
-/** Browser plugin entry point registering the sidebar icon, main management panel, and Plugin Manager config view. */
-import { useCallback, useEffect, useRef } from 'react'
-import type { Context } from '@deepseek-ai/cordis'
-import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
-import type { SidebarPanelIconOwnerProps } from '@deepseek-ai/dsh-client-ui-sidebar/client'
-import type {} from '@deepseek-ai/dsh-client-locale/client'
-import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
-import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-import type { PluginConfigViewProps } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
-import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
-import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import { openKnownSession, SessionNavigationError } from '../navigation.ts'
+/** Standalone browser React entry point mounting the Superagent management panel. */
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createRoot } from 'react-dom/client'
+import { openSessionLink, SessionNavigationError } from '../navigation.ts'
+import { ApiError, caller } from './api.ts'
 import { App } from './app.tsx'
-import { PluginConfig, usePageForm } from './deployment.tsx'
+import { useHttpDeploymentForm, type DeploymentForm } from './deployment.tsx'
 import { en, zh } from './locales.ts'
-import type { T } from './text.ts'
+import { apiMessages } from './provider.tsx'
+import { createTranslator } from './text.ts'
 
-type ClientContext = Context & { sessions: ISessions }
-const NS = 'dshSuperagent'
-const PANEL_ID = 'dsh-superagent' as MainPanelId
-const ENTRY = 'dsh-superagent'
+export type Language = 'zh' | 'en'
+export type Theme = 'system' | 'light' | 'dark'
+const LANG_KEY = 'dsh-superagent/lang'
+const THEME_KEY = 'dsh-superagent/theme'
+const THEMES: readonly Theme[] = ['system', 'light', 'dark']
 
-function HammerIcon({ size }: SidebarPanelIconOwnerProps) {
-  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-    <path d="M6 3.5h9l3.5 1.75v2.5L15 9.5H6a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z" /><path d="M10 9.5v10.25a1.75 1.75 0 0 0 3.5 0V9.5" /><path d="M10 15.5h3.5" />
-  </svg>
+function readStorage<V extends string>(key: string, allowed: readonly V[], fallback: V): V {
+  try {
+    const value = localStorage.getItem(key)
+    return allowed.find(item => item === value) ?? fallback
+  } catch {
+    return fallback
+  }
+}
+function writeStorage(key: string, value: string): void {
+  try { localStorage.setItem(key, value) } catch { /* Preference persistence is optional. */ }
 }
 
-/** Mounted panel wrapper; cancels any pending Session navigation when a new one starts or the panel unmounts. */
-function Mounted({ ctx, t }: { ctx: ClientContext; t: T }) {
+function defaultOpenUrl(url: string): void {
+  window.location.assign(url)
+}
+
+export interface StandaloneAppProps {
+  initialLang?: Language
+  initialTheme?: Theme
+  openUrl?: (url: string) => void
+  deploymentForm?: DeploymentForm
+}
+
+/** Root standalone Superagent application owning locale, color theme, deployment polling, and Paseo link navigation. */
+export function StandaloneApp({ initialLang, initialTheme, openUrl = defaultOpenUrl, deploymentForm }: StandaloneAppProps) {
+  const [lang, setLang] = useState<Language>(() => initialLang ?? readStorage(LANG_KEY, ['zh', 'en'], 'zh'))
+  const [theme, setTheme] = useState<Theme>(() => initialTheme ?? readStorage(THEME_KEY, THEMES, 'system'))
+
+  const t = useMemo(() => createTranslator(lang === 'en' ? en : zh), [lang])
+  const copy = useRef(t)
+  copy.current = t
+  const call = useMemo(() => caller(() => apiMessages(copy.current)), [])
+  const httpDeploymentForm = useHttpDeploymentForm(call)
+
+  useEffect(() => {
+    document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN'
+  }, [lang])
+
+  useEffect(() => {
+    const root = document.documentElement
+    const body = document.body
+    const media = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-color-scheme: dark)') : undefined
+    const sync = () => {
+      if (theme === 'system') delete root.dataset.theme
+      else root.dataset.theme = theme
+      const dark = theme === 'dark' || (theme === 'system' && !!media?.matches)
+      if (dark) body.dataset.dsDarkTheme = ''
+      else delete body.dataset.dsDarkTheme
+    }
+    sync()
+    if (theme !== 'system' || !media) return
+    media.addEventListener?.('change', sync)
+    return () => { media.removeEventListener?.('change', sync) }
+  }, [theme])
+
   const pending = useRef<AbortController>(undefined)
   useEffect(() => () => { pending.current?.abort() }, [])
   const openSession = useCallback(async (id: string) => {
     pending.current?.abort()
-    const request = new AbortController(); pending.current = request
+    const request = new AbortController()
+    pending.current = request
     try {
-      await openKnownSession(ctx.sessions, id as SessionId, target => { ctx.uiWorkspace.openSession(target) }, request.signal)
+      await openSessionLink((target, signal) => call('GET sessions/:id/link', { id: target, signal }), id, openUrl, request.signal)
     } catch (error) {
-      if (error instanceof SessionNavigationError) throw new Error(t(error.code === 'not-ready' ? 'sessionListNotReady' : 'sessionNotListed'))
+      if (request.signal.aborted) return
+      if (error instanceof SessionNavigationError) {
+        throw new Error(copy.current(error.code === 'invalid-link' ? 'sessionInvalidLink' : 'sessionNotListed'))
+      }
+      if (error instanceof ApiError && error.missing) {
+        throw new Error(copy.current('sessionNotListed'))
+      }
       throw error
     }
-  }, [ctx, t])
-  const form = usePageForm(ctx.get('configForms')?.get<Record<string, unknown>>(ENTRY))
-  return <App t={t} openSession={openSession} deploymentForm={form} />
+  }, [call, openUrl])
+
+  const toggleLang = useCallback(() => {
+    setLang(current => {
+      const next = current === 'zh' ? 'en' : 'zh'
+      writeStorage(LANG_KEY, next)
+      return next
+    })
+  }, [])
+
+  const cycleTheme = useCallback(() => {
+    setTheme(current => {
+      const next = THEMES[(THEMES.indexOf(current) + 1) % THEMES.length]!
+      writeStorage(THEME_KEY, next)
+      return next
+    })
+  }, [])
+
+  return <App t={t} openSession={openSession} deploymentForm={deploymentForm ?? httpDeploymentForm}
+    lang={lang} onToggleLang={toggleLang} theme={theme} onCycleTheme={cycleTheme} />
 }
 
-export const inject = ['slots', 'locale', 'sessions', 'uiWorkspace']
-/** Registers the panel, sidebar icon, and Plugin Manager config view; `configForms` is optional (without it, machine settings are read-only). */
-export function apply(ctx: ClientContext): void {
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-superagent: dictionaries')
-  const t = ctx.locale.bind(NS)
-  ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID, locale: NS, inject: () => ({}) },
-    (props: { t: T }) => <Mounted ctx={ctx} t={props.t} />))
-  ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL_ID, order: 10, label: () => t('panel'), locale: NS }, HammerIcon))
-  ctx.slots.inject('plugins.row.config', () => ctx.slots.register({ name: 'plugins.row.config', key: `${ENTRY}#${ENTRY}`, locale: NS },
-    (props: PluginConfigViewProps & { t: T }) => <PluginConfig t={props.t} view={props.view} form={props.form} />))
+/** Mount the standalone Superagent panel into `container`. */
+export function mountStandalone(container: HTMLElement, props: StandaloneAppProps = {}) {
+  const root = createRoot(container)
+  root.render(<StandaloneApp {...props} />)
+  return { unmount: () => root.unmount() }
+}
+
+function boot() {
+  const target = typeof document !== 'undefined' ? document.getElementById('root') : null
+  if (target) mountStandalone(target)
+}
+
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true })
+  else boot()
 }

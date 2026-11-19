@@ -4,6 +4,7 @@ import { basename } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
+import type { OutboundMessage } from '../core/index.ts'
 
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
@@ -61,19 +62,29 @@ export class Commands {
    * @param resolved - returns the resolved deployment setup, or throws while setup is still pending.
    * @param environment - variables overriding `process.env` for every command (such as isolated git settings).
    */
-  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
+  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal,
+    readonly paseoSend?: (message: OutboundMessage) => Promise<'sent'>) {}
   get deployment(): Deployment { return this.resolved() }
   get repository(): string { return this.deployment.repository }
-  withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
+  withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal]), this.paseoSend) : this }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
+    this.signal.throwIfAborted()
+    const running = exec(program, args, { cwd, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+      env: { ...process.env, ...this.environment, DINGTALK_CLIENT_SECRET: undefined, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+    const child = running.child
+    // A failed spawn has no PID. Attach cancellation only after spawn, so it can never signal an unstarted process handle.
+    const abort = () => { if (child.pid && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM') }
+    const spawned = () => { if (this.signal.aborted) abort(); else this.signal.addEventListener('abort', abort, { once: true }) }
+    child.once('spawn', spawned)
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+      const { stdout } = await running
+      this.signal.throwIfAborted()
       return stdout
-    } catch (error) { throw commandError(error, program) }
+    } catch (error) { this.signal.throwIfAborted(); throw commandError(error, program) }
+    finally { child.off('spawn', spawned); this.signal.removeEventListener('abort', abort) }
   }
-  /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  /** Runs the agent's forge CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
+  async forge<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.forge.cli, args)) as T }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,13 +93,13 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(this.deployment.forge.cli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
-    return schema.parse(await this.gh(['api', this.path(path), ...flags]))
+    return schema.parse(await this.forge(['api', this.path(path), ...flags]))
   }
   /** Fetches all pages of a GitHub API list within the configured repository, skipping items that fail schema validation. */
   async pages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
-    const pages = z.array(z.array(z.unknown())).parse(await this.gh(['api', this.path(path), '--paginate', '--slurp']))
+    const pages = z.array(z.array(z.unknown())).parse(await this.forge(['api', this.path(path), '--paginate', '--slurp']))
     return validItems(item, pages.flat(), tally)
   }
   private path(path: string): string {

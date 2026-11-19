@@ -8,7 +8,7 @@ import { Button, DisclosureRow, Icon, InfoTip, Input, Pill, SegmentedControl, Sw
 import { SaveBar } from './draft.tsx'
 import { useAction, usePanel } from './provider.tsx'
 import { DecisionLine } from './rows.tsx'
-import { ConfigHistory, Field, Fields, ModelField, SourceField, numberOf, useBlockDraft, useSettings } from './settings-kit.tsx'
+import { ConfigHistory, Field, Fields, ProfileField, SourceField, numberOf, useBlockDraft, useSettings } from './settings-kit.tsx'
 import { localized, valueLabel, when } from './text.ts'
 import { Hint, LabelValue, LoadMore, LoadState, Section, StatusHead } from './widgets.tsx'
 
@@ -208,8 +208,8 @@ function EvalBlock() {
         <Input type="number" min={LIMITS.evalTimeoutSeconds.min} max={LIMITS.evalTimeoutSeconds.max} required value={value.timeoutSeconds}
           onChange={event => edit({ timeoutSeconds: event.target.value })} />
       </Field>
-      <Section title={t('assessorModel')} hint={t('assessorModelHint')}>
-        <ModelField id="dt-eval-model" value={value.model} onChange={model => edit({ model })} />
+      <Section title={t('assessorProfile')} hint={t('assessorProfileHint')}>
+        <ProfileField id="dt-eval-profile" value={value.model} onChange={model => edit({ model })} />
       </Section>
     </Fields>
     <SaveBar {...draft} onDiscard={draft.discard} />

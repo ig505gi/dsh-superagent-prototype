@@ -119,6 +119,25 @@ it('offers a Ticket awaiting review its review place and Session in the page hea
     'https://github.com/acme/widgets/pull/42']])
 })
 
+it('shows the Session instead of an empty answer link for a DingTalk question', async () => {
+  const channel = { source: 'dingtalk', url: '', label: { zh: '钉钉群', en: 'DingTalk group' } }
+  server.person[0] = { ...server.person[0]!, reply: channel }
+  const t1 = server.ticketDetails.t1!
+  server.ticketDetails.t1 = { ...t1, stage: 'person', action: 'answer', channels: [channel],
+    attention: { id: 'q1', question: '选 A 还是 B？' } }
+  await mount()
+  const question = all('.dt-ticket').find(row => row.textContent?.includes('修复回归'))!
+  expect(question.querySelector('.dt-ticket-actions a')).toBeNull()
+  await click(find(zh.openSession, '.dt-ticket button'))
+  expect(server.opened).toContain('worker-t1')
+  await click(question.querySelector<HTMLElement>('.dt-open')!)
+  expect(document.querySelector('.dt-banner-actions')).toBeNull()
+  expect(find(zh.openSession, '.dt-page-head button')).toBeTruthy()
+  await click(zh['term.channel'])
+  expect(document.querySelector('.dt-disclosure-body a')).toBeNull()
+  expect(text()).toContain('钉钉群')
+})
+
 it('keeps what a person types in the Execution settings, converting it once on save', async () => {
   await mount()
   await click(zh['tab.execution'])

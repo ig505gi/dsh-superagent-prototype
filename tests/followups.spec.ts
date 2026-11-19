@@ -2,7 +2,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { repliedTo } from '../src/app/links.ts'
-import { inputMessage } from '../src/executor/dsh.ts'
+import { inputMessage } from '../src/executor/paseo.ts'
 
 let h: Host | undefined
 afterEach(async () => { await h?.stop(); h = undefined })

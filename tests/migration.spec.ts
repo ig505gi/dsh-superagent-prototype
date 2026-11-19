@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { trashSync } from './fixtures/trash.ts'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -11,7 +12,25 @@ import { masterPrompt } from '../src/app/context.ts'
 
 let directory: string
 beforeEach(() => { directory = mkdtempSync(join(tmpdir(), 'orchestrator-migration-')) })
-afterEach(() => { rmSync(directory, { recursive: true, force: true }) })
+afterEach(() => { trashSync(directory, { recursive: true, force: true }) })
+
+it('opens schema 11 with legacy model routes unset and preserves the surrounding versioned settings', () => {
+  const path = join(directory, 'schema11.sqlite'), store = new Store(path)
+  const legacy = { ...store.settings(), paused: true, eval: { mode: 'auto', timeoutSeconds: 120, model: { provider: 'p', model: 'm' } },
+    executor: { ...store.settings().executor, model: { provider: 'p', model: 'other', reasoningEffort: 'medium' }, maxWorkers: 5 } }
+  store.set(KV.store.schema, 11)
+  store.set(KV.settings.revision, 2)
+  store.set(KV.settings.block('executor'), 1)
+  store.set('settings-version:2', { revision: 2, savedAt: '', source: 'panel', policyVersion: '', policyChanged: false, notified: [], settings: legacy })
+  store.close()
+  const migrated = new Store(path)
+  try {
+    expect(migrated.get(KV.store.schema)).toBe(SCHEMA_VERSION)
+    expect(migrated.settings()).toMatchObject({ paused: true, eval: { mode: 'auto', model: null }, executor: { maxWorkers: 5, model: null } })
+    expect(migrated.settingsHistory()[0]).toMatchObject({ revision: 2 })
+    expect(migrated.blockRevision('executor')).toBe(1)
+  } finally { migrated.close() }
+})
 
 /** Seed a SQLite database in the schema 10 layout (including the legacy `outbox.sent` column and `inbox` table). */
 function schema10(path: string, records: Record<string, unknown>, rows: { ticket?: object[]; decision?: object[]; thread?: object[]; trigger?: object[] } = {}): void {
@@ -202,7 +221,7 @@ it('changes nothing when one step fails: the database stays at schema 10 as it w
     updatedAt: '2', mandate: mandate({ via: 'listed' }), meta: { sourceTriggerId: 'trig-1', workspace: '/w/fix-1' } }
   // The current settings must validate; an invalid value aborts the migration transaction.
   schema10(path, { settings: { executor: { maxWorkers: 'many' } } }, { ticket: [ticket] })
-  expect(() => new Store(path)).toThrow(/^The orchestrator database is unchanged at schema 10: its migration to schema 11 failed: the settings: /)
+  expect(() => new Store(path)).toThrow(/^The orchestrator database is unchanged at schema 10: its migration to schema 12 failed: the settings: /)
   const db = new DatabaseSync(path)
   expect(db.prepare("SELECT value FROM kv WHERE key='schema'").get()).toEqual({ value: '10' })
   expect(JSON.parse(String(db.prepare("SELECT value FROM ticket WHERE id='t1'").get()!.value))).toMatchObject({ meta: { workspace: '/w/fix-1' } })
@@ -475,7 +494,7 @@ it('names the ticket it stopped at when a ticket does not read, and leaves the d
   const path = join(directory, 'db.sqlite')
   const { inputs: _inputs, ...broken } = ticket10('t9')
   schema10(path, {}, { ticket: [broken] })
-  expect(() => new Store(path)).toThrow(/^The orchestrator database is unchanged at schema 10: its migration to schema 11 failed: ticket t9: /)
+  expect(() => new Store(path)).toThrow(/^The orchestrator database is unchanged at schema 10: its migration to schema 12 failed: ticket t9: /)
   const db = new DatabaseSync(path)
   expect(db.prepare("SELECT value FROM kv WHERE key='schema'").get()).toEqual({ value: '10' })
   expect(JSON.parse(String(db.prepare("SELECT value FROM ticket WHERE id='t9'").get()!.value))).toEqual(broken)

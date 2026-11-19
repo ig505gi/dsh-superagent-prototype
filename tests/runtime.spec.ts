@@ -1,16 +1,17 @@
-import { Context } from '@deepseek-ai/cordis'
-import { bindScopeParent } from '@deepseek-ai/dsh-scope'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { trashSync } from './fixtures/trash.ts'
+import { Context } from '../src/runtime/context.ts'
+import { controlToolNames } from '../src/runtime/tools.ts'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
-import type { UserMessage } from '@deepseek-ai/dsh-llm'
-import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import type { UserMessage } from '../src/runtime/types.ts'
+import { renderPrompt } from '../src/runtime/context.ts'
 import { Runtime } from '../src/app/runtime.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
-import { mandateInstructions } from '../src/executor/dsh.ts'
+import { mandateInstructions } from '../src/executor/paseo.ts'
 import { masterPrompt } from '../src/app/context.ts'
 import { reference, testMachine } from './fixtures/deployment.ts'
 import type { Machine } from '../src/deployment.ts'
@@ -34,6 +35,7 @@ import { overview } from '../src/app/views/overview.ts'
 import { preview, readable } from '../src/app/views/text.ts'
 import { decisionList, search, threadDetail, threadList } from '../src/app/views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from '../src/app/views/tickets.ts'
+import { deferred, waitUntil } from './fixtures/async.ts'
 
 let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
@@ -136,7 +138,7 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
 }
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'orchestrator-runtime-'))
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
+  vi.spyOn(Commands.prototype, 'forge').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
@@ -163,20 +165,14 @@ beforeEach(async () => {
     create: vi.fn(async ({ sessionId, agentPreset }) => {
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
-      const preset = {}
-      const inherited = ['bash', 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
-        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit']
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
       agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name,
         tool); return () => sessionTools.delete(tool.name) },
-        // Preset tools are inherited; subagent is registered on the agent itself and cannot be named by restrict.
-        get: (name: string, scope?: object) => {
-          const own = scope === agents.get(sessionId)
-          return (scope === preset || own) && inherited.includes(name) || own && name === 'subagent' ? { name } : undefined
-        },
+        get: (name: string) => sessionTools.get(name),
         restrict: vi.fn((rule: { allow: string[] }) => {
-          if (rule.allow.some(name => !inherited.includes(name))) throw new Error('Restriction names a non-inherited tool')
+          const allowed = new Set([...sessionTools.keys(), ...controlToolNames('worker')])
+          if (rule.allow.some(name => !allowed.has(name))) throw new Error('Restriction names an unknown application tool')
           restricts.set(sessionId, [...restricts.get(sessionId) ?? [], rule]); return () => {}
         }),
         guard: vi.fn((check: Guard) => { guards.set(sessionId, check); return () => {} }) })
@@ -196,7 +192,6 @@ beforeEach(async () => {
         agents.get(sessionId)!.status = 'running'
       })
       agents.set(sessionId, { id: sessionId, ctx: agentCtx, inbox, followup: deliver('queue'), steer: deliver('steer'), status: 'idle', inject: vi.fn(), session: { id: sessionId, header: { agentPreset }, snapshotEvents: () => modelEvents, requestHeader: () => undefined, append: vi.fn((type: string, data: unknown) => { modelEvents.push({ type, data }) }) }, cancel: vi.fn(), whenIdle: async () => {} } as never)
-      bindScopeParent(agents.get(sessionId)!, preset)
     }),
     selectModel: vi.fn(async () => {}), resolveAgent: vi.fn(async id => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }), rename: vi.fn(async () => {}),
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
@@ -214,7 +209,7 @@ beforeEach(async () => {
   runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...runtime.store.settings().policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } }, eval: { ...runtime.store.settings().eval, mode: 'auto' }, sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT() } }, feishu: { enabled: true, config: { cli: BOT(), chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
   deliveries.mockClear()
 })
-afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
+afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); trashSync(directory, { recursive: true, force: true }) })
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()
@@ -431,6 +426,91 @@ it('tells live workers about policy changes instead of revoking them and restart
   expect(relays(runtime.masterId).filter(item => item.kind === 'candidate' && item.trigger_id === pending.id)).toHaveLength(1)
 })
 
+it('delivers real candidate cards with distinct evaluation IDs and policy versions for one trigger', async () => {
+  const trigger = feishu('window-card', '把标题里的错字改好', { mentions: [] })
+  await receive(trigger)
+  const E0 = runtime.engine.candidate(trigger.id)!
+  const first = relays(runtime.masterId).find(card => card.kind === 'candidate' && card.trigger_id === trigger.id)!
+  expect(first).toMatchObject({ eval_id: E0.evalId, policy_version: E0.policyVersion })
+  const policy = runtime.store.settings().policy
+  await runtime.settings.save('policy', { ...policy, rules: policy.rules.map(rule => rule.id === 'copy' ? { ...rule, name: rule.name + ' updated' } : rule) }, runtime.store.blockRevision('policy'), 'panel')
+  await runtime.idle()
+  const E1 = runtime.engine.candidate(trigger.id)!
+  const cards = relays(runtime.masterId).filter(card => card.kind === 'candidate' && card.trigger_id === trigger.id)
+  expect(cards).toHaveLength(2)
+  expect(cards[1]).toMatchObject({ eval_id: E1.evalId, policy_version: E1.policyVersion, trigger_id: trigger.id })
+  expect(E1.evalId).not.toBe(E0.evalId)
+  expect(E1.policyVersion).not.toBe(E0.policyVersion)
+  expect(JSON.stringify(cards[0])).not.toBe(JSON.stringify(cards[1]))
+  expect(cards[1]!.eval_scope).toContain('different eval_id')
+  expect(cards[1]).not.toHaveProperty('active')
+})
+
+it('drops an obsolete card after async sourceLink and starts the replacement deadline only on delivery', async () => {
+  const oldEntered = deferred(), oldLink = deferred(), newEntered = deferred(), newLink = deferred()
+  const trigger = feishu('window-link', '把标题里的错字改好', { mentions: [] })
+  const linkResult = { messages: [{ message_id: 'om_window-link', chat_id: CHAT, message_app_link: 'https://example.invalid/owned-message' }] }
+  vi.mocked(Commands.prototype.lark).mockImplementationOnce(async () => { oldEntered.resolve(); await oldLink.promise; return linkResult })
+    .mockImplementationOnce(async () => { newEntered.resolve(); await newLink.promise; return linkResult })
+  try {
+    runtime.receive(trigger)
+    await oldEntered.promise
+    const E0 = runtime.engine.candidate(trigger.id)!
+    expect(E0.thread.evaluating?.delivered).toBeUndefined()
+    const policy = runtime.store.settings().policy
+    await runtime.settings.save('policy', { ...policy, rules: policy.rules.map(rule => rule.id === 'copy' ? { ...rule, name: rule.name + ' updated' } : rule) }, runtime.store.blockRevision('policy'), 'panel')
+    await newEntered.promise
+    const E1 = runtime.engine.candidate(trigger.id)!
+    expect(E1.evalId).not.toBe(E0.evalId)
+    expect(E1.thread.evaluating?.delivered).toBeUndefined()
+    oldLink.resolve()
+    await waitUntil(() => !runtime.effects.pending('assessment', E0.evalId))
+    expect(relays(runtime.masterId).filter(card => card.kind === 'candidate' && card.trigger_id === trigger.id)).toEqual([])
+    const releasedAt = new Date().toISOString()
+    newLink.resolve()
+    await runtime.idle()
+    const cards = relays(runtime.masterId).filter(card => card.kind === 'candidate' && card.trigger_id === trigger.id)
+    expect(cards).toHaveLength(1)
+    expect(cards[0]).toMatchObject({ eval_id: E1.evalId, policy_version: E1.policyVersion })
+    const delivered = runtime.engine.candidate(trigger.id)!.thread.evaluating!
+    expect(delivered.delivered! >= releasedAt).toBe(true)
+    expect(Date.parse(delivered.deadline) - Date.parse(delivered.delivered!)).toBe(runtime.store.settings().eval.timeoutSeconds * 1000)
+    const messageId = runtime.sessions.promptedId(`candidate:${E1.evalId}`)
+    expect(deliveries.mock.calls.filter(([call]) => call.id === messageId)).toHaveLength(1)
+    runtime.assessor.request(runtime.engine.candidate(trigger.id)!)
+    await runtime.idle()
+    expect(deliveries.mock.calls.filter(([call]) => call.id === messageId)).toHaveLength(1)
+  } finally { oldLink.resolve(); newLink.resolve(); await runtime.idle() }
+})
+
+it('scopes an old read after a real policy save and persists the next decision against E1', async () => {
+  const trigger = feishu('window-read', '把标题里的错字改好', { mentions: [] })
+  await receive(trigger)
+  const E0 = runtime.engine.candidate(trigger.id)!, entered = deferred(), release = deferred()
+  vi.spyOn(runtime.sources, 'threadContext').mockReturnValue({ messageId: 'om_window-read', images: () => [], image: async () => { throw new Error('No test images') },
+    read: async () => { entered.resolve(); await release.promise; return { messages: [], body: {} } } })
+  const pending = runtime.assessor.context(trigger.id).catch((error: unknown) => error)
+  try {
+    await entered.promise
+    const policy = runtime.store.settings().policy
+    await runtime.settings.save('policy', { ...policy, rules: policy.rules.map(rule => rule.id === 'copy' ? { ...rule, name: rule.name + ' updated' } : rule) }, runtime.store.blockRevision('policy'), 'panel')
+    await runtime.idle()
+    const E1 = runtime.engine.candidate(trigger.id)!
+    expect(() => runtime.engine.decide(trigger.id, { kind: 'ignore', evalId: E0.evalId, reason: 'stale' })).toThrow(UserError)
+    release.resolve()
+    const error = await pending
+    expect(error).toBeInstanceOf(Error)
+    expect(JSON.parse((error as Error).message.split('\n')[1]!)).toMatchObject({ eval_id: E0.evalId, trigger_id: trigger.id, current_eval_id: E1.evalId, current_policy_version: E1.policyVersion })
+    expect(await runTool(runtime.masterId, 'orchestrator_eval', { trigger_id: trigger.id })).toMatchObject({ eval_id: E1.evalId, policy_version: E1.policyVersion })
+    await runTool(runtime.masterId, 'orchestrator_eval_decide', { trigger_id: trigger.id, decision: 'ignore',
+      rule_assessments: runtime.store.settings().policy.rules.filter(rule => rule.enabled).map(rule => ({ rule_id: rule.id, matched: false, reason: 'No work in this regression decision.' })),
+      direction: { implementation_requested: false, target_basis: 'undetermined', requires_design_decision: false, evidence: 'Test finishes the current window.' },
+      title: 'No work', scope: 'None', reason: 'Window identity regression' })
+    expect(runtime.store.decisions.byThread(E1.thread.key).at(-1)).toMatchObject({ evalId: E1.evalId, kind: 'ignore' })
+    expect(runtime.store.tickets.list()).toEqual([])
+  } finally { release.resolve(); await pending }
+})
+
 it('attaches an event to an existing open task through orchestrator_route', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   const other = feishu('9', '@bot 顺手把这里也改了', { root_id: undefined })
@@ -477,7 +557,7 @@ it('relays an allowed sender\'s mention in a new Issue as an explicit candidate 
   const notification = { id: 'n1', updated_at: issue.created_at, reason: 'mention', repository: { full_name: 'acme/widgets' },
     subject: { url: 'https://api.github.com/repos/acme/widgets/issues/12', type: 'Issue', title: issue.title } }
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue(`HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\n\r\n${JSON.stringify([notification])}`)
-  vi.spyOn(Commands.prototype, 'gh').mockResolvedValue(issue)
+  vi.spyOn(Commands.prototype, 'forge').mockResolvedValue(issue)
   vi.spyOn(Commands.prototype, 'pages').mockResolvedValue([])
   runtime.store.set('github-since', '2026-09-08T23:59:00.000Z')
   await pollRound(runtime.context(githubKind))
@@ -492,7 +572,7 @@ it('ignores an allowed sender\'s new Issue that does not mention the agent, and 
     const notification = { id: `n${number}`, updated_at: issue.created_at, reason: 'subscribed', repository: { full_name: 'acme/widgets' },
       subject: { url: `https://api.github.com/repos/acme/widgets/issues/${number}`, type: 'Issue', title: issue.title } }
     vi.spyOn(Commands.prototype, 'run').mockResolvedValue(`HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\n\r\n${JSON.stringify([notification])}`)
-    vi.spyOn(Commands.prototype, 'gh').mockResolvedValue(issue)
+    vi.spyOn(Commands.prototype, 'forge').mockResolvedValue(issue)
     vi.spyOn(Commands.prototype, 'pages').mockResolvedValue([])
     runtime.store.set('github-since', '2026-09-08T23:59:00.000Z')
     await pollRound(runtime.context(githubKind))
@@ -555,7 +635,7 @@ it('projects read models for the management page and removes thread subscription
   runtime.store.threads.describe(thread.key, { label: 'Named by its source' })
   expect(threadList(viewsOf(runtime), 'all', 0, 20).items[0]).toMatchObject({ title: 'Named by its source' })
   expect((await api('GET', 'state')).body).not.toHaveProperty('tickets')
-  // scripts/dsh-superagent and agents read health from GET state (docs/006, Management API); settings and their revisions have their own route.
+  // scripts/superagent status --config <path> and agents read health from GET state (docs/006, Management API); settings and their revisions have their own route.
   expect((await api('GET', 'state')).body).toMatchObject({ health: { runtime: { state: expect.any(String) } }, paused: false, load: { maxWorkers: 3 } })
   expect((await api('GET', 'settings')).body).toMatchObject({ sources: expect.arrayContaining([expect.objectContaining({ id: 'github',
     revision: expect.any(Number), value: expect.objectContaining({ enabled: true }) })]), blocks: { policy: { revision: expect.any(Number) } } })
@@ -871,7 +951,7 @@ it('reports each setup problem where the operator fixes it, and checks the agent
 it('reports a failure to write the agent environment as environmentFailed and leaves this process\'s environment as it was', async () => {
   await runtime.stop()
   // The shim directory cannot be made: a file has its name.
-  rmSync(join(directory, 'worker-bin'), { recursive: true, force: true })
+  trashSync(join(directory, 'worker-bin'), { recursive: true, force: true })
   writeFileSync(join(directory, 'worker-bin'), '')
   const environment = { ...process.env }
   const next = await restart()
@@ -972,12 +1052,12 @@ it('runs setup again while the Feishu bot check failed, and restores the process
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli', 'personal-gh'])
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
   expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
@@ -1004,9 +1084,9 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli', 'personal-gh'])
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()
@@ -1306,10 +1386,10 @@ it('refuses a settings save with an unknown model or a Source kind that is not i
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
-  vi.mocked(services.llm as { resolveCallConfig: ReturnType<typeof vi.fn> }).resolveCallConfig.mockRejectedValueOnce(new Error('unknown provider nowhere'))
-  const evalBlock = { ...runtime.store.settings().eval, model: { provider: 'nowhere', model: 'x' } }
+  Object.assign(controller, { modelCatalog: async () => ({ profiles: [], failures: [] }) })
+  const evalBlock = { ...runtime.store.settings().eval, model: { profileId: 'missing', name: 'Missing', provider: 'nowhere' } }
   expect(await request('PUT', 'settings/eval', { value: evalBlock, revision: runtime.store.blockRevision('eval') }))
-    .toMatchObject({ status: 400, body: { code: 'modelUnavailable', values: { block: 'eval', error: 'unknown provider nowhere' } } })
+    .toMatchObject({ status: 400, body: { code: 'profileUnavailable', values: { block: 'eval' } } })
   const stored = runtime.store.settings()
   runtime.store.saveSettings({ ...stored, sources: { ...stored.sources, slack: { enabled: false, config: {} } } })
   expect(await request('PUT', 'settings/source:slack', { value: { enabled: true, config: {} }, revision: 0 }))
@@ -1331,7 +1411,7 @@ it('records a report, the PR it binds and its relay together, or none of them', 
   // A report the Engine refuses binds no PR, though the PR itself could be bound.
   await expect(runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done', pr_number: 42, human_action: 'Ship it?' })).rejects.toThrow()
   // A PR the pull request rules refuse records no report.
-  vi.mocked(Commands.prototype.gh).mockImplementation(async args => args[1]?.includes('/pulls/')
+  vi.mocked(Commands.prototype.forge).mockImplementation(async args => args[1]?.includes('/pulls/')
     ? { state: 'open', user: { login: 'someone' }, html_url: 'https://github.com/acme/widgets/pull/7', head: { ref: 'feature/other', sha: 'h', repo: { full_name: 'acme/widgets' } } }
     : { default_branch: 'master', permissions: { push: true } })
   await expect(runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 7, human_action: 'Desktop too?' })).rejects.toThrow()
@@ -1492,7 +1572,7 @@ it('fails a ticket at once on a worker error that is not passing, and relays it'
 })
 
 it('refuses the main Session a bash command that runs sleep and a long job wait, as reports arrive by themselves, and no worker', async () => {
-  const bash = (command: string) => ({ name: 'bash', arguments: { command, description: 'x' } })
+  const bash = (command: string) => ({ name: 'superagent_shell', arguments: { command, description: 'x' } })
   const main = guards.get(runtime.masterId)!
   for (const command of ['sleep 60; echo done', 'cd x && sleep 5', 'gh pr checks 7 || sleep 30', 'echo a\nsleep 90', 'while true; do sleep 30; done',
     '(sleep 5)', '/bin/sleep 240', 'while sleep 30; do gh pr checks 7; done', 'if sleep 5; then gh pr view 7; fi', '{ sleep 60; }', '! sleep 5',
@@ -1503,25 +1583,25 @@ it('refuses the main Session a bash command that runs sleep and a long job wait,
     expect(main(bash(command)), command).toBeUndefined()
   // A command that asks to hold the step longer than 30 seconds, however it waits, under any preset.
   const timed = (command: string, args: { timeoutMs?: number; run_in_background?: boolean } = {}) =>
-    ({ name: 'bash', arguments: { command, description: 'x', ...args } })
+    ({ name: 'superagent_shell', arguments: { command, description: 'x', ...args } })
   expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 120_000 }))).toMatch(/^Reports/)
   expect(main(timed("python3 -c 'import time;time.sleep(240)'", { timeoutMs: 600_000 }))).toMatch(/^Reports/)
   expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 20_000 }))).toBeUndefined()
   // Under the router preset, the shell moves a command without a timeout to a background job after 5 seconds, and a job
   // wait without one ends after 5 seconds too; a longer job wait waits for nothing that arrives that way.
   expect(main(timed('gh pr checks 7 --watch'))).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true } })).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 30_000 } })).toMatch(/^Reports/)
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j' } })).toBeUndefined()
+  expect(main({ name: 'superagent_job_output', arguments: { job_id: 'j', wait: true } })).toBeUndefined()
+  expect(main({ name: 'superagent_job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 30_000 } })).toMatch(/^Reports/)
+  expect(main({ name: 'superagent_job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
+  expect(main({ name: 'superagent_job_output', arguments: { job_id: 'j' } })).toBeUndefined()
   // A main Session created before runs under standard, whose shell waits 60 seconds by default and whose job waits last 30:
   // a command without a timeout runs in the background or names one, and a job wait names one.
   ;(agents.get(runtime.masterId) as unknown as { session: { header: { agentPreset: string } } }).session.header = { agentPreset: 'standard' }
   expect(main(timed('gh pr checks 7 --watch'))).toMatch(/^This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000/)
   expect(main(timed('gh pr checks 7 --watch', { run_in_background: true }))).toBeUndefined()
   expect(main(timed('gh api repos/acme/widgets/pulls', { timeoutMs: 20_000 }))).toBeUndefined()
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true } })).toMatch(/^Reports/)
-  expect(main({ name: 'job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
+  expect(main({ name: 'superagent_job_output', arguments: { job_id: 'j', wait: true } })).toMatch(/^Reports/)
+  expect(main({ name: 'superagent_job_output', arguments: { job_id: 'j', wait: true, timeout_ms: 5_000 } })).toBeUndefined()
   // A worker waits for its own work as it needs.
   const { sessionId } = await acceptedTicket()
   expect(guards.get(sessionId)!(bash('sleep 60'))).toBeUndefined()
@@ -1530,7 +1610,7 @@ it('refuses the main Session a bash command that runs sleep and a long job wait,
 })
 
 it('reads the main Session\'s preset from a registry with or without presetForSession, and takes standard\'s caps when it cannot', async () => {
-  const watch = { name: 'bash', arguments: { command: 'gh pr checks 7 --watch', description: 'x' } }
+  const watch = { name: 'superagent_shell', arguments: { command: 'gh pr checks 7 --watch', description: 'x' } }
   const route = { name: 'orchestrator_route', arguments: { decisions: [] } }
   const guard = async (registry: Record<string, unknown>, projections?: Record<string, unknown>) => {
     services.agentPresets = registry
@@ -1560,10 +1640,10 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   expect(guards.get(sessionId)!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
-  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }])
+  expect(restricts.get(runtime.masterId)).toEqual([{ allow: [...tools.get(runtime.masterId)!.keys(), ...controlToolNames('orchestrator')] }])
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
-  expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get(sessionId)).toEqual([{ allow: [...tools.get(sessionId)!.keys(), ...controlToolNames('worker')] }])
 })
 
 it('gives an explicit ticket\'s worker a prompt without the limits of an inferred Mandate', async () => {
@@ -1717,7 +1797,7 @@ it('gives a subagent of a worker only the worker\'s work tools, and none once th
   const child = agents.get('child-1')! as unknown as { session: { header: { parentSession?: string } } }
   child.session.header = { parentSession: sessionId }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
-  expect(restricts.get('child-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get('child-1')).toEqual([{ allow: [...tools.get('child-1')!.keys(), ...controlToolNames('worker')] }])
   expect(guards.get('child-1')!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get('child-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
@@ -1739,7 +1819,7 @@ it('gives a subagent of a worker\'s subagent the same work tools and guard', asy
     agent.session.header = { parentSession: parent }
     await created.parallel('agent/created', { agent } as never)
   }
-  expect(restricts.get('grandchild-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get('grandchild-1')).toEqual([{ allow: [...tools.get('grandchild-1')!.keys(), ...controlToolNames('worker')] }])
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get('grandchild-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
 })

@@ -1,5 +1,5 @@
 /**
- * Migrates a schema 10 database to schema 11 in a single transaction so runtime readers never convert legacy shapes.
+ * Migrates a supported database to the current schema in a single transaction.
  * Databases older than schema 10 are rejected: this version cannot migrate them.
  */
 import { basename } from 'node:path'
@@ -17,7 +17,7 @@ import type { SettingsVersion, Store } from './store.ts'
 import { Versions } from './versions.ts'
 import { KV, type Key } from '../kv.ts'
 
-export const SCHEMA_VERSION = 11
+export const SCHEMA_VERSION = 12
 /** The oldest database schema version this build can open and migrate directly. */
 export const OLDEST_SCHEMA = 10
 /** Returns an error message explaining why `version` cannot be opened: older schemas need a new state directory. */
@@ -197,6 +197,26 @@ function migrateSettingsRecords(store: Store): void {
     store.set(name, { ...version, source: ORIGINS[version.source] ?? version.source, ...settings.success ? { settings: settings.data } : {} })
   }
 }
+
+function withoutLegacyRoleModels(value: unknown): unknown {
+  if (!isObject(value)) return value
+  const settings = { ...value }
+  for (const role of ['eval', 'executor']) {
+    const block = settings[role]
+    if (isObject(block) && isObject(block.model) && !('profileId' in block.model)) {
+      settings[role] = { ...block, model: null }
+    }
+  }
+  return settings
+}
+
+/** Older model routes have no Paseo profile ID. Clear those selections while keeping the rest of each settings revision. */
+export function migrateTo12(store: Store): void {
+  for (const key of store.keys('settings-version:')) {
+    const version = store.get<SettingsVersion>(key)!
+    store.set(key, { ...version, settings: withoutLegacyRoleModels(version.settings) })
+  }
+}
 interface Member { name?: string; feishuId?: string; github?: string }
 /**
  * Convert legacy flat settings (chat lists in Policy, top-level pause flag) or pre-schema-11 domain settings into current domain blocks:
@@ -204,7 +224,7 @@ interface Member { name?: string; feishuId?: string; github?: string }
  */
 export function migrateSettings(value: unknown): unknown {
   if (!isObject(value)) return value
-  if (!('members' in value || 'allowedChats' in value || 'admission' in value)) return withoutRemovedFields(value)
+  if (!('members' in value || 'allowedChats' in value || 'admission' in value)) return withoutLegacyRoleModels(withoutRemovedFields(value))
   const old = value as { models?: { orchestrator?: unknown; worker?: unknown }; paused?: boolean; allowedChats?: string[]; members?: unknown[];
     allowDirectMessages?: boolean; pollSeconds?: number; maxWorkers?: number; admission?: { mode?: string; chats?: string[]; timeoutSeconds?: number; rules?: unknown[] } }
   const chats = new Map<string, 'mentions' | 'all'>()
@@ -212,13 +232,13 @@ export function migrateSettings(value: unknown): unknown {
   // Observed chats were active only when admission was enabled.
   if (old.admission?.mode !== 'off') for (const chatId of old.admission?.chats ?? []) chats.set(chatId, 'all')
   const feishu = { chats: [...chats].map(([chatId, listen]) => ({ chatId, listen })), directMessages: old.allowDirectMessages ?? true }
-  return withoutRemovedFields({
+  return withoutLegacyRoleModels(withoutRemovedFields({
     sources: { feishu: { enabled: true, config: feishu }, github: { enabled: true, config: { pollSeconds: old.pollSeconds ?? 60 } } },
     policy: { ...(old.members ? { members: old.members } : {}), ...(old.admission?.rules ? { rules: old.admission.rules } : {}) },
     eval: { ...(old.admission?.mode ? { mode: old.admission.mode } : {}), ...(old.admission?.timeoutSeconds ? { timeoutSeconds: old.admission.timeoutSeconds } : {}),
       model: old.models?.orchestrator ?? null },
     executor: { model: old.models?.worker ?? null, ...(old.maxWorkers ? { maxWorkers: old.maxWorkers } : {}), paused: old.paused ?? false },
-  })
+  }))
 }
 function withoutRemovedFields(value: Stored): Stored {
   const { executor, policy, sources, ...rest } = value as { executor?: Stored; policy?: Stored; sources?: Record<string, Stored> }

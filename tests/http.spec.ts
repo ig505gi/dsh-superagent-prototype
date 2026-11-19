@@ -27,6 +27,7 @@ function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.
 
 it('answers each kind of failure with its own status', async () => {
   const saves: unknown[] = []
+  const sensitiveMarker = 'sensitive-error-marker'
   const call = serve({
     store: { tickets: { get: () => undefined }, blockRevision: () => 0 },
     sources: { instances: () => [{ id: 'github' }] },
@@ -35,14 +36,17 @@ it('answers each kind of failure with its own status', async () => {
       if (args[1] === 'stale') throw new SettingsConflict('Settings changed. Reload before saving.')
       if (args[1] === 'invalid') z.object({ maxWorkers: z.number() }).parse({})
       if (args[1] === 'refused') throw new SetupError('agentCliUnset')
-      if (args[1] === 'broken') throw new Error('disk full')
+      if (args[1] === 'broken') throw new Error(`disk full ${sensitiveMarker}`)
       return { saved: true, revision: 1, restarting: false }
     } },
   })
   expect(await call('PUT', 'settings/executor', { value: 'stale', revision: 0 })).toMatchObject({ status: 409 })
   expect(await call('PUT', 'settings/executor', { value: 'invalid', revision: 0 })).toMatchObject({ status: 400, body: { issues: [{ path: 'maxWorkers' }] } })
   expect(await call('PUT', 'settings/source:github', { value: 'refused', revision: 0 })).toMatchObject({ status: 400, body: { setup: { code: 'agentCliUnset', place: 'github' } } })
-  expect(await call('PUT', 'settings/executor', { value: 'broken', revision: 0 })).toEqual({ status: 500, body: { error: 'disk full' } })
+  const broken = await call('PUT', 'settings/executor', { value: 'broken', revision: 0 })
+  expect(broken).toEqual({ status: 500, body: { error: 'Internal server error' } })
+  expect(JSON.stringify(broken.body)).not.toContain('disk full')
+  expect(JSON.stringify(broken.body)).not.toContain(sensitiveMarker)
   // Block names are validated before calling settings.save: reject unknown blocks or non-existent Sources.
   expect(await call('PUT', 'settings/pause', { value: {}, revision: 0 })).toMatchObject({ status: 400 })
   expect(await call('PUT', 'settings/source:feishu', { value: {}, revision: 0 })).toEqual({ status: 404, body: { error: 'Source not found' } })

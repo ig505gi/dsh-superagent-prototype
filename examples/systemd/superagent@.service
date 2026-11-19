@@ -1,0 +1,24 @@
+[Unit]
+Description=Superagent (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Use the account that runs Paseo so it can access the local workspaces.
+User=superagent
+Group=superagent
+WorkingDirectory=/opt/superagent
+StateDirectory=superagent/%i
+StateDirectoryMode=0700
+UMask=0077
+Environment="GLAB_CONFIG_DIR=/var/lib/superagent/%i/glab"
+Environment="GH_CONFIG_DIR=/var/lib/superagent/%i/gh"
+EnvironmentFile=/etc/superagent/%i/runtime.env
+ExecStart=/usr/bin/env node /opt/superagent/lib/server/main.js --config /etc/superagent/%i/config.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

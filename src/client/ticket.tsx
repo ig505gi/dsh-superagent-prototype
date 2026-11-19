@@ -143,7 +143,7 @@ export function TicketPage({ id }: { id: string }) {
     {ended && <Hint>{ended}</Hint>}
     {data.attention && <div className="dt-banner"><span className="dt-banner-label">{t('attentionPrefix')}</span><MarkdownLite
       text={data.attention.question} />
-      {channel && <div className="dt-banner-actions">
+      {channel?.url && <div className="dt-banner-actions">
         <ActionLink href={channel.url} icon="message">{t('answerIn', { source: valueLabel(t, 'source', channel.source) })}</ActionLink>
       </div>}</div>}
     {/* Ordinary progress stays in the Session/Channels; only a report that halted work (blocked/failed) is shown here. */}
@@ -175,7 +175,8 @@ export function TicketPage({ id }: { id: string }) {
       </Details>}
       <Details icon="message" title={t('term.channel')}>
         <ul className="dt-plain-list">{data.channels.map((item, index) => <li key={index}>
-          <ExternalLink href={item.url} icon={item.source === 'github' ? 'pull' : 'message'}>{localized(t, item.label)}</ExternalLink>
+          {item.url ? <ExternalLink href={item.url} icon={item.source === 'github' ? 'pull' : 'message'}>{localized(t, item.label)}</ExternalLink>
+            : localized(t, item.label)}
         </li>)}</ul>
       </Details>
       {data.inputs.length > undelivered.length && <Details icon="inbox" title={t('deliveredInputs',

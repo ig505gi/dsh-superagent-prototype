@@ -69,37 +69,42 @@ function SwitchRow({ label, hint, checked,
   </div>
 }
 type RoleModel = Settings['eval']['model']
-export function ModelField({ id, value, onChange }: { id: string; value: RoleModel; onChange: (next: RoleModel) => void }) {
+export function ProfileField({ id, value, onChange }: { id: string; value: RoleModel; onChange: (next: RoleModel) => void }) {
   const { t, call } = usePanel()
   const [catalog, setCatalog] = useState<ApiResponse<'GET models'>>()
   const [error, setError] = useState<string>()
-  useEffect(() => { call('GET models').then(setCatalog, failure => setError(errorText(failure))) }, [call])
-  const current = { provider: value?.provider ?? '', model: value?.model ?? '', effort: value?.reasoningEffort ?? '' }
-  const set = (next: Partial<typeof current>) => {
-    const { provider, model, effort } = { ...current, ...next }
-    onChange(provider.trim() || model.trim() || effort.trim() ? { provider, model, ...effort ? { reasoningEffort: effort } : {} } : null)
-  }
-  const models = catalog?.groups.find(group => group.id === current.provider.trim())?.models ?? []
-  const fallback = catalog?.default
-  const input = (name: keyof typeof current, label: string, placeholder: string) => <Field label={label}>
-    <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
-      onChange={event => set({ [name]: event.target.value })} />
-  </Field>
+  useEffect(() => {
+    let active = true
+    call('GET models').then(result => { if (active) { setCatalog(result); setError(undefined) } },
+      failure => { if (active) setError(errorText(failure)) })
+    return () => { active = false }
+  }, [call])
+  const profiles = catalog?.profiles ?? []
+  const current = profiles.find(profile => profile.profileId === value?.profileId)
+  const available = profiles.some(profile => profile.available)
+  const details = (profile: NonNullable<RoleModel>) =>
+    [profile.provider, profile.model, profile.modeId, profile.thinkingOptionId].filter(Boolean).join(' · ')
+
   return <div className="dt-model">
-    <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
-      ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
-    {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
-    <div className="dt-grid3">
-      {input('provider', t('modelProvider'), t('modelInherit'))}{input('model', t('modelName'), t('modelInherit'))}{input('effort',
-        t('modelEffort'), t('modelEffortDefault'))}
-    </div>
-    <datalist id={`${id}-providers`}>{catalog?.groups.map(group => <option key={group.id}
-      value={group.id}>{group.name}</option>)}</datalist>
-    <datalist id={`${id}-models`}>{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
-    <datalist id={`${id}-efforts`}>
-      {(models.find(model => model.id === current.model.trim())?.reasoning?.efforts ?? []).map(effort => <option key={effort.id}
-        value={effort.id}>{effort.name}</option>)}
-    </datalist>
+    <label htmlFor={id}>{t('paseoProfile')}</label>
+    <select id={id} className="dt-select" value={value?.profileId ?? ''} disabled={!available} onChange={event => {
+      const profile = profiles.find(item => item.profileId === event.target.value && item.available)
+      if (profile) {
+        const { available: _available, ...selection } = profile
+        onChange(selection)
+      }
+    }}>
+      <option value="" disabled>{t('chooseProfile')}</option>
+      {value && !current && <option value={value.profileId} disabled>{value.name} · {t('profileUnavailable')}</option>}
+      {profiles.map(profile => <option key={profile.profileId} value={profile.profileId} disabled={!profile.available}>
+        {profile.name} · {details(profile)}{!profile.available && (' · ' + t('profileUnavailable'))}
+      </option>)}
+    </select>
+    {value && <Hint>{details(value)}</Hint>}
+    {error && <p className="dt-error">{t('profileCatalogError', { error })}</p>}
+    {catalog && catalog.failures.length > 0 && <p className="dt-error">{t('profileCatalogUnavailable')}</p>}
+    {catalog && !catalog.failures.length && !available && <Hint>{t(profiles.length ? 'noAvailableProfiles' : 'noProfiles')}</Hint>}
+    {catalog && value && !current?.available && available && <Hint>{t('savedProfileUnavailable')}</Hint>}
   </div>
 }
 

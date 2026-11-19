@@ -1,5 +1,6 @@
+import { trashSync } from './fixtures/trash.ts'
 /** The durable effect queue: coalescing, per-kind limits, retries with backoff, health and shutdown. */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -23,7 +24,7 @@ beforeEach(() => {
   effects = new Effects(store, board, () => clock)
   effects.start()
 })
-afterEach(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
+afterEach(() => { store.close(); trashSync(directory, { recursive: true, force: true }) })
 const relay = (text: string) => ({ text })
 
 it('runs an effect queued inside a transaction once it commits, and none from a transaction that rolled back', async () => {

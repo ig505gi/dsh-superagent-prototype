@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { expect, vi } from 'vitest'
 import { App } from '../../src/client/app.tsx'
 import { usePageForm } from '../../src/client/deployment.tsx'
+import { StandaloneApp, type StandaloneAppProps } from '../../src/client/index.tsx'
 import { zh } from '../../src/client/locales.ts'
 import type { T } from '../../src/client/text.ts'
 import { server, usePanelServer } from './panel-server.ts'
@@ -39,6 +40,12 @@ export async function mount(dictionary: Record<string, string> = zh) {
   container = document.createElement('div'); document.body.append(container)
   root = createRoot(container)
   await act(async () => { root!.render(<Panel t={translator(dictionary)} />) })
+  await settle()
+}
+export async function mountApp(props: StandaloneAppProps = {}) {
+  container = document.createElement('div'); document.body.append(container)
+  root = createRoot(container)
+  await act(async () => { root!.render(<StandaloneApp {...props} />) })
   await settle()
 }
 export async function remount(dictionary: Record<string, string> = zh) { unmount(); await mount(dictionary) }

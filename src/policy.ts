@@ -67,7 +67,16 @@ const DEFAULT_RULES = [
 export const RuleSchema = z.object({ id: RuleIdSchema, name: z.string().trim().min(1).max(LIMITS.ruleName), enabled: z.boolean(),
   instruction: z.string().trim().min(1).max(LIMITS.ruleInstruction) }).strict()
 export type Rule = z.infer<typeof RuleSchema>
-export const RoleModelSchema = z.object({ provider: z.string().trim().min(1), model: z.string().trim().min(1), reasoningEffort: z.string().trim().min(1).optional() }).strict()
+const profileValue = z.string().refine(value => value.trim().length > 0)
+export const RoleModelSchema = z.object({
+  profileId: profileValue,
+  name: profileValue,
+  provider: profileValue,
+  model: profileValue.optional(),
+  modeId: profileValue.optional(),
+  thinkingOptionId: profileValue.optional(),
+  featureValues: z.record(z.string(), z.unknown()).optional(),
+}).strict()
 export type RoleModel = z.infer<typeof RoleModelSchema>
 
 export const AllowedSchema = z.object({ id: z.string().trim().min(1).max(200), name: z.string().trim().max(100).optional() }).strict()

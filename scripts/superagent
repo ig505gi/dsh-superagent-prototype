@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Manage one standalone Node Superagent instance using an explicit configuration file.
+
+Status exits 0 when ready, 1 when stopped/unreachable/duplicated, 2 for component errors,
+and 3 while setup needs attention. Credentials are read only from environment or files.
+"""
+import argparse
+import fcntl
+import http.cookiejar
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent.parent
+ENTRY = ROOT / 'lib/server/main.js'
+
+
+def atomic(path, value):
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('w') as stream:
+        json.dump(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def read(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def identity(pid):
+    try:
+        result = subprocess.run(['/bin/ps', '-ww', '-p', str(pid), '-o', 'lstart=', '-o', 'command='], capture_output=True, text=True, check=True)
+        return result.stdout.strip() or None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def processes(control, config):
+    result = subprocess.run(['/bin/ps', '-axww', '-o', 'pid=', '-o', 'command='], capture_output=True, text=True, check=True)
+    found = set()
+    arguments = str(ENTRY) + ' --config ' + str(config)
+    for line in result.stdout.splitlines():
+        words = line.strip().split(None, 1)
+        if len(words) == 2 and words[0].isdigit():
+            command = words[1]
+            if command == arguments or command.endswith(' ' + arguments):
+                found.add(int(words[0]))
+    # A live process may still use the entry from the previous checkout.
+    recorded = read(control / 'process.json')
+    pid, birth = recorded.get('pid'), recorded.get('identity')
+    if type(pid) is int and pid > 0 and isinstance(birth, str) and birth.endswith('/lib/server/main.js --config ' + str(config)):
+        if identity(pid) == birth:
+            found.add(pid)
+    return sorted(found)
+
+
+def health(url):
+    try:
+        with urllib.request.urlopen(url + '/healthz', timeout=2) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def management_starting(url):
+    try:
+        with urllib.request.urlopen(url + '/orchestrator/api/state', timeout=2):
+            return False
+    except urllib.error.HTTPError as error:
+        return error.code == 503
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def snapshot(url):
+    inline, file = os.environ.get('SUPERAGENT_PASSWORD'), os.environ.get('SUPERAGENT_PASSWORD_FILE')
+    if bool(inline) == bool(file):
+        return None
+    password = inline if inline else Path(file).read_text().removesuffix('\n').removesuffix('\r')
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    try:
+        login = urllib.request.Request(url + '/login', data=json.dumps({'password': password}).encode(),
+                                      headers={'Content-Type': 'application/json', 'Origin': url})
+        opener.open(login, timeout=3).close()
+        request = urllib.request.Request(url + '/orchestrator/api/state', headers={'Origin': url, 'x-orchestrator-request': '1'})
+        with opener.open(request, timeout=3) as response:
+            return json.load(response)
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def status(args, control, config, url):
+    pids = processes(control, config)
+    data = snapshot(url) if pids else None
+    part = data.get('health', {}) if isinstance(data, dict) else {}
+    errors = {key: value.get('detail', '') for key, value in part.items() if key != 'runtime' and value.get('state') == 'error'}
+    setup = data.get('setup', {}) if isinstance(data, dict) else {}
+    waiting = setup.get('problem') if isinstance(setup, dict) else None
+    stopped = bool(read(control / 'operator.json').get('stopped'))
+    code = 1 if len(pids) != 1 or data is None or part.get('runtime', {}).get('state') == 'error' else 3 if waiting else 2 if errors else 0
+    print(json.dumps({'pids': pids, 'manually_stopped': stopped, 'reachable': data is not None,
+                      'setup_pending': bool(waiting), 'errors': errors}, indent=2))
+    return code
+
+
+def stop(args, control, config, intentional):
+    pids = processes(control, config)
+    if len(pids) > 1:
+        raise RuntimeError('Multiple Superagent processes found; no process was signalled.')
+    atomic(control / 'operator.json', {'stopped': intentional})
+    if pids:
+        pid = pids[0]
+        recorded = read(control / 'process.json')
+        birth = identity(pid)
+        if recorded.get('pid') == pid and recorded.get('identity') and recorded['identity'] != birth:
+            raise RuntimeError('The recorded process identity changed; no signal was sent.')
+        if not birth or pid not in processes(control, config) or identity(pid) != birth:
+            return
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + args.stop_timeout
+        while time.monotonic() < deadline and identity(pid) == birth:
+            time.sleep(.1)
+        if identity(pid) == birth:
+            raise RuntimeError('Graceful stop timed out; the process was left running.')
+    print('Superagent stopped. Automatic recovery is paused.' if intentional else 'Superagent stopped.')
+
+
+def start(args, control, config, url):
+    pids = processes(control, config)
+    if len(pids) > 1:
+        raise RuntimeError('Multiple Superagent processes found; no duplicate was started.')
+    if not pids:
+        if health(url):
+            raise RuntimeError('An existing service answers at this URL; no duplicate was started.')
+        if not ENTRY.is_file():
+            raise RuntimeError('Build the standalone application before starting it.')
+        logs = control / 'logs'
+        logs.mkdir(exist_ok=True)
+        log = logs / (time.strftime('%Y%m%d-%H%M%S-') + str(os.getpid()) + '.log')
+        with log.open('ab') as stream:
+            child = subprocess.Popen(['node', str(ENTRY), '--config', str(config)], cwd=ROOT,
+                                     stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        atomic(control / 'process.json', {'pid': child.pid, 'identity': identity(child.pid)})
+        print('Log: ' + str(log), flush=True)
+        older = sorted(logs.glob('*.log'), key=lambda path: path.stat().st_mtime)[:-20]
+        if older:
+            archive = logs / 'archive'
+            archive.mkdir(exist_ok=True)
+            for path in older:
+                path.replace(archive / path.name)
+    atomic(control / 'operator.json', {'stopped': False})
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        if processes(control, config) and health(url) and not management_starting(url):
+            return status(args, control, config, url)
+        time.sleep(.1)
+    raise RuntimeError('Startup health check timed out; any owned process was left intact.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status'])
+    parser.add_argument('--config', required=True, help='Standalone JSON configuration path; each instance needs its own stateDir.')
+    parser.add_argument('--timeout', type=float, default=60)
+    parser.add_argument('--stop-timeout', type=float, default=30)
+    parser.add_argument('--respect-stop', action='store_true')
+    args = parser.parse_args()
+    if args.timeout <= 0 or args.stop_timeout <= 0:
+        parser.error('Timeouts must be positive')
+    os.umask(0o077)
+    config = Path(args.config).resolve()
+    settings = read(config)
+    state_dir = Path(settings.get('stateDir', ''))
+    if not state_dir.is_absolute():
+        raise RuntimeError('An absolute stateDir is required.')
+    control = state_dir / 'control'
+    control.mkdir(parents=True, exist_ok=True)
+    host, port = settings.get('host', '127.0.0.1'), settings.get('port', 3083)
+    url = settings.get('publicOrigin', 'http://' + ('[' + host + ']' if ':' in host else host) + ':' + str(port)).rstrip('/')
+    with (control / 'operation.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another Superagent control operation is in progress.') from None
+        if args.respect_stop and args.action in ('start', 'restart') and read(control / 'operator.json').get('stopped'):
+            print('Intentional stop is active; automatic recovery skipped.')
+            return 0
+        if args.action == 'status':
+            return status(args, control, config, url)
+        if args.action in ('stop', 'restart'):
+            stop(args, control, config, args.action == 'stop')
+        return start(args, control, config, url) if args.action in ('start', 'restart') else 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError):
+        # Configurations, credentials and command stderr are never printed on a control failure.
+        print('Superagent control failed; check the exclusive state, process record, configuration and service log.', file=sys.stderr)
+        sys.exit(1)

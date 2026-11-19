@@ -1,6 +1,6 @@
 /** Main-session assessor per-eval state and context loading. */
 import { expect, it, vi } from 'vitest'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent } from '../src/runtime/types.ts'
 import { AssessmentSchema, EvalReadSchema, MasterAssessor, type AssessorHost } from '../src/app/assessment.ts'
 import { mainAdmissionPolicy } from '../src/app/context.ts'
 import { Engine, MemoryRepositories, type Executor, type Policy, type Trigger } from '../src/core/index.ts'
@@ -39,7 +39,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
   const host: AssessorHost = {
     get engine() { return engine }, commands, deployment: testDeployment(), settings: () => SettingsSchema.parse({}),
     threadContext: threadContext ?? (trigger => sources.threadContext(trigger)),
-    effects: { enqueue: () => {}, handle: () => {} }, paused: () => false, deliver: async () => {}, candidateCard: async candidate => ({ eval_id: candidate.evalId }),
+    effects: { enqueue: () => {}, handle: () => {} }, paused: () => false, deliver: async () => {}, candidateCard: async () => ({}),
   }
   const assessor = new MasterAssessor(host)
   const policy: Policy = { version: 'v1', paused: false, evalTimeoutMs: 600_000, gate: () => ({ admissible: true, strength, basis: { via: 'followup' } }),
@@ -57,7 +57,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
   // Per-Eval state retained by the assessor and released when the Eval ends.
   const kept = assessor as unknown as { evals: Map<string, unknown> }
   const size = () => kept.evals.size
-  return { repo, engine, assessor, tools, size, gate }
+  return { repo, engine, assessor, tools, size, gate, commands, policy }
 }
 const issue = (n: number): Trigger => ({ id: `issue-${n}`, source: 'github', threads: [{ source: 'github', id: String(n) }], actor: { source: 'github', id: 'bob' }, human: true,
   at: new Date(Date.UTC(2026, 8, 9, 0, 0, n)).toISOString(), text: `issue ${n}`, url: `https://github.com/acme/widgets/issues/${n}`, meta: { number: n } })
@@ -91,6 +91,78 @@ it('keeps nothing from a context read that finishes after its Eval was decided',
   hold.resolve()
   await expect(details).rejects.toThrow('This assessment has finished')
   expect(s.size()).toBe(0)
+})
+
+it('scopes a finished read to its old window without inventing a new window', async () => {
+  const s = setup(), hold = deferred()
+  s.gate.issue = hold.promise
+  s.engine.receive(issue(1)); s.engine.evaluateDue()
+  const E0 = s.engine.candidate('issue-1')!
+  const pending = s.assessor.context('issue-1', signal).catch((error: unknown) => error)
+  await vi.waitFor(() => expect(s.commands.api).toHaveBeenCalled())
+  s.engine.decide('issue-1', { kind: 'ignore', reason: 'finished' })
+  hold.resolve()
+  const error = await pending
+  expect(error).toBeInstanceOf(Error)
+  const scope = JSON.parse((error as Error).message.split('\n')[1]!)
+  expect(scope).toMatchObject({ eval_id: E0.evalId, trigger_id: 'issue-1' })
+  expect(scope).not.toHaveProperty('current_eval_id')
+  expect(scope).not.toHaveProperty('current_policy_version')
+  expect(scope.next_action).not.toContain('Call orchestrator_eval')
+  expect(s.engine.candidate('issue-1')).toBeUndefined()
+})
+
+it('names a real replacement window, rejects the old decision, and loads the new context identity', async () => {
+  const s = setup(), hold = deferred()
+  s.gate.issue = hold.promise
+  s.engine.receive(issue(1)); s.engine.evaluateDue()
+  const E0 = s.engine.candidate('issue-1')!
+  const pending = s.assessor.context('issue-1', signal).catch((error: unknown) => error)
+  await vi.waitFor(() => expect(s.commands.api).toHaveBeenCalled())
+  s.policy.version = 'v2'; s.engine.policyChanged('v1', 'v2'); s.engine.evaluateDue()
+  const E1 = s.engine.candidate('issue-1')!
+  expect(E1.evalId).not.toBe(E0.evalId)
+  expect(() => s.engine.decide('issue-1', { kind: 'ignore', reason: 'stale', evalId: E0.evalId })).toThrow()
+  hold.resolve()
+  const error = await pending
+  expect(error).toBeInstanceOf(Error)
+  expect(JSON.parse((error as Error).message.split('\n')[1]!)).toMatchObject({ eval_id: E0.evalId, trigger_id: 'issue-1',
+    current_eval_id: E1.evalId, current_policy_version: 'v2', next_action: expect.stringContaining('Call orchestrator_eval with this trigger_id') })
+  expect(await s.assessor.context('issue-1', signal)).toMatchObject({ eval_id: E1.evalId, policy_version: 'v2' })
+  expect(() => EvalReadSchema.parse({ trigger_id: 'issue-1', eval_id: E0.evalId, resource: 'message' })).toThrow()
+})
+
+it('does not advertise a replacement that finished before the old read returned', async () => {
+  const s = setup(), hold = deferred()
+  s.gate.issue = hold.promise
+  s.engine.receive(issue(1)); s.engine.evaluateDue()
+  const pending = s.assessor.context('issue-1', signal).catch((error: unknown) => error)
+  await vi.waitFor(() => expect(s.commands.api).toHaveBeenCalled())
+  s.policy.version = 'v2'; s.engine.policyChanged('v1', 'v2'); s.engine.evaluateDue()
+  s.engine.decide('issue-1', { kind: 'ignore', reason: 'replacement finished' })
+  hold.resolve()
+  const error = await pending
+  expect(error).toBeInstanceOf(Error)
+  expect(JSON.parse((error as Error).message.split('\n')[1]!)).not.toHaveProperty('current_eval_id')
+})
+
+it('keeps an explicit replacement on the routing path instead of granting assessment access', async () => {
+  const s = setup(), hold = deferred()
+  s.gate.issue = hold.promise
+  s.engine.receive(issue(1)); s.engine.evaluateDue()
+  const pending = s.assessor.context('issue-1', signal).catch((error: unknown) => error)
+  await vi.waitFor(() => expect(s.commands.api).toHaveBeenCalled())
+  s.policy.version = 'v2'; s.policy.gate = () => ({ admissible: true, strength: 'explicit', basis: { via: 'followup' } })
+  s.engine.policyChanged('v1', 'v2'); s.engine.evaluateDue()
+  const E1 = s.engine.candidate('issue-1')!
+  hold.resolve()
+  const error = await pending
+  expect(error).toBeInstanceOf(Error)
+  const scope = JSON.parse((error as Error).message.split('\n')[1]!)
+  expect(scope).toMatchObject({ current_eval_id: E1.evalId, current_policy_version: 'v2' })
+  expect(scope.next_action).toContain('orchestrator_route')
+  expect(scope.next_action).not.toContain('Call orchestrator_eval')
+  await expect(s.assessor.context('issue-1', signal)).rejects.toThrow('explicit request')
 })
 
 it('reads the context of a Trigger through its Source, and none for a Source that gives none', async () => {

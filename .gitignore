@@ -2,4 +2,13 @@ node_modules/
 lib/
 .artifacts/
 .env
+.env.*
+!.env.example
+*.log
+*.sqlite*
+*.db*
+tmp/
+*.tmp
+.DS_Store
 coverage/
+web/assets/

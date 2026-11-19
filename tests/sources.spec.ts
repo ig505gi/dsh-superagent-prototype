@@ -1,3 +1,4 @@
+import { trashSync } from './fixtures/trash.ts'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Engine, MemoryRepositories, key, type Assessor, type Executor, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
 import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, feishuTime, feishuTrigger, historyEvent }
@@ -19,7 +20,7 @@ import { testDeployment } from './fixtures/deployment.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
 import { SetupError, type SetupProblem } from '../src/setup.ts'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1037,7 +1038,7 @@ describe('feishu event consumer', () => {
     controller.abort()
     await running
     vi.useRealTimers()
-    rmSync(dir, { recursive: true, force: true })
+    trashSync(dir, { recursive: true, force: true })
   })
   /**
    * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
@@ -1089,12 +1090,14 @@ describe('feishu event consumer', () => {
   it('takes in the event lines it reads, records each chat as direct or not, and reports a malformed line without stopping', async () => {
     writeFileSync(join(dir, 'events'), [event('om_1', 'oc_group', 'group'), event('om_2', 'oc_dm', 'p2p'), 'not json',
       event('om_3', 'oc_group', 'group')].join('\n') + '\n')
-    const { ctx, health, store } = consumerSource(cli('events'))
+    const { ctx, store } = consumerSource(cli('events'))
+    const report = vi.spyOn(ctx, 'report')
     running = runFeishu(ctx, controller.signal)
     await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_3'))).toBeDefined(), until)
     expect(['om_1', 'om_2'].map(id => store.triggers.get(feishuTriggerId(id))?.meta.direct)).toEqual([false, true])
     expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
-    expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+    // stdout and stderr are independent: the CLI's ready line may arrive after the malformed event.
+    expect(report).toHaveBeenCalledWith('feishu', expect.objectContaining({ state: 'error', detail: expect.stringContaining('JSON') }))
     controller.abort(); await running; store.close()
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {
@@ -1129,8 +1132,8 @@ describe('feishu event consumer', () => {
       stop.abort(); await loops; lark.mockRestore()
       const cursors = Object.fromEntries(['oc_a', 'oc_b', 'oc_dm'].map(chat => [chat, store.get(KV.feishu.history(chat))]))
       const result = { chats, cursors, history: health.history }
-      store.close(); rmSync(join(dir, 'db.sqlite'), { force: true }); rmSync(join(dir, 'db.sqlite-wal'), { force: true })
-      rmSync(join(dir, 'db.sqlite-shm'), { force: true })
+      store.close(); trashSync(join(dir, 'db.sqlite'), { force: true }); trashSync(join(dir, 'db.sqlite-wal'), { force: true })
+      trashSync(join(dir, 'db.sqlite-shm'), { force: true })
       return result
     }
     const on = await recovered(true)

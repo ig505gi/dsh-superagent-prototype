@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { trashSync } from './fixtures/trash.ts'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -27,7 +28,7 @@ beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), 'dsh-superagent-views-'))
   store = new Store(join(directory, 'orchestrator.sqlite'))
 })
-afterEach(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
+afterEach(() => { store.close(); trashSync(directory, { recursive: true, force: true }) })
 const links = (channel: ChannelRef) => (channel.source === 'feishu' ? feishuLink : githubLink)(channel.address, {})
 const drop = (id: string, channel: ChannelRef, ticketId?: string) => {
   const message = { id, channel, text: id, kind: 'reply' as const, ...ticketId ? { ticketId } : {} }

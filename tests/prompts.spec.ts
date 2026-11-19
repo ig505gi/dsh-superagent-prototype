@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { trashSync } from './fixtures/trash.ts'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -18,7 +19,7 @@ const ENVIRONMENT_LINE = '- DSH_SUPERAGENT_GITHUB_REPOSITORY = "acme/widgets": T
 const promptsOf = (store: Store, maxChars = 100000) => new Prompts(store, () => maxChars, variables, () => true)
 function withStore(body: (store: Store, dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), 'prompts-')); const store = new Store(join(dir, 'db'))
-  try { body(store, dir) } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+  try { body(store, dir) } finally { store.close(); trashSync(dir, { recursive: true, force: true }) }
 }
 
 it('saves team sections and skills as versions that survive a restart, with history and rollback', () => {
@@ -41,7 +42,7 @@ it('saves team sections and skills as versions that survive a restart, with hist
     expect(prompts.history(2, 1).next_offset).toBeNull()
     expect(prompts.history(1, 1).revisions[0]).toMatchObject({ revision: 1, changed: ['scope', 'delivery', 'skill/release'] })
     expect(() => prompts.save(config, 1, 'panel')).toThrow('version changed')
-  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+  } finally { store.close(); trashSync(dir, { recursive: true, force: true }) }
 })
 
 it('assembles every role from fixed sections around the team sections, whatever the configuration says', () => {
@@ -67,7 +68,7 @@ it('reads a prompt file whatever its line ends and blank lines, and names a miss
     expect(promptFile(name('crlf'))).toBe('One. Two.\nThree.')
     expect(() => promptFile(name('blank'))).toThrow(`Empty packaged file: ${join(dir, 'blank.md')}`)
     expect(() => promptFile(name('absent'))).toThrow(`Missing packaged file: ${join(dir, 'absent.md')}`)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+  } finally { trashSync(dir, { recursive: true, force: true }) }
 })
 
 it('leaves the UI before-and-after evidence to the delivery requirements, which a team can change', () => {

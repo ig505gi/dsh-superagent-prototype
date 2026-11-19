@@ -12,13 +12,13 @@ import { testDeployment } from './fixtures/deployment.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
-const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
+const deployment = testDeployment({ forge: { ...testDeployment().forge, cli: '/path/agent-gh' } })
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
 describe('account-isolated operations', () => {
-  it('uses the agent account\'s GitHub CLI and preserves literal shell metacharacters in argv', async () => {
+  it('uses the agent account\'s forge CLI and preserves literal shell metacharacters in argv', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{}')
-    await commands.gh(['api','some-path','-f','body=`whoami` $(touch x)'])
+    await commands.forge(['api','some-path','-f','body=`whoami` $(touch x)'])
     expect(run).toHaveBeenCalledWith('/path/agent-gh', ['api','some-path','-f','body=`whoami` $(touch x)'])
   })
   it('runs every command with its environment over the process environment, where undefined removes a variable', async () => {
@@ -35,12 +35,12 @@ describe('account-isolated operations', () => {
   it('reconciles an uncertain GitHub send with its stable marker', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
     vi.spyOn(commands,'pages').mockResolvedValue([{ body:'<!-- dsh-superagent:stable-operation -->',user:{login:'agent-bot'} }])
-    const gh = vi.spyOn(commands,'gh')
+    const gh = vi.spyOn(commands,'forge')
     await send(commands, reply); expect(gh).not.toHaveBeenCalled()
   })
   it('posts the reply as the model wrote it, only to the fixed repository', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); vi.spyOn(commands,'pages').mockResolvedValue([])
-    const gh = vi.spyOn(commands,'gh').mockResolvedValue({})
+    const gh = vi.spyOn(commands,'forge').mockResolvedValue({})
     await send(commands, reply)
     // The disclosure line is prompt text: the model writes it, and the host adds nothing.
     expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f',expect.stringMatching(/^body=Done\n\n<!-- dsh-superagent:stable-operation -->$/)])
@@ -49,7 +49,7 @@ describe('account-isolated operations', () => {
   })
   it('routes review-comment replies to the root review comment', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); vi.spyOn(commands,'pages').mockResolvedValue([])
-    const gh = vi.spyOn(commands,'gh').mockResolvedValueOnce({ id: 7, in_reply_to_id: 3 }).mockResolvedValueOnce({})
+    const gh = vi.spyOn(commands,'forge').mockResolvedValueOnce({ id: 7, in_reply_to_id: 3 }).mockResolvedValueOnce({})
     await send(commands, { ...reply, channel: githubChannel(8, `https://github.com/${REPOSITORY}/pull/8#discussion_r7`) })
     expect(gh.mock.calls[1]![0]).toEqual(['api', `repos/${REPOSITORY}/pulls/8/comments/3/replies`, '--method', 'POST', '-f', expect.stringContaining('Done')])
   })
@@ -92,7 +92,7 @@ describe('Channels', () => {
   it('drop a GitHub reply to an Issue that is deleted or locked, and keep others for a retry', async () => {
     const value = commands()
     vi.spyOn(value, 'pages').mockResolvedValue([])
-    const gh = vi.spyOn(value, 'gh')
+    const gh = vi.spyOn(value, 'forge')
     for (const stderr of ['gh: This issue was deleted (HTTP 410)', 'gh: Unable to create comment because issue is locked. (HTTP 403)']) {
       gh.mockRejectedValueOnce(commandError({ stderr, code: 1 }))
       expect(await send(value, reply)).toBe('gone')
@@ -106,7 +106,7 @@ describe('Channels', () => {
   it('reply on the PR\'s conversation when the review comment a reply points at is gone', async () => {
     const value = commands()
     const pages = vi.spyOn(value, 'pages').mockResolvedValue([])
-    const gh = vi.spyOn(value, 'gh')
+    const gh = vi.spyOn(value, 'forge')
       .mockRejectedValueOnce(commandError({ stderr: 'gh: Not Found (HTTP 404)', code: 1 })).mockResolvedValueOnce({})
     expect(await send(value, { ...reply, channel: githubChannel(8, `https://github.com/${REPOSITORY}/pull/8#discussion_r7`) })).toBe('sent')
     expect((pages.mock.calls[0] as unknown[])[1]).toBe('issues/8/comments')
@@ -212,4 +212,16 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   lifetime.abort()
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
+})
+it('can cancel a failed spawn before it has a PID without signalling an unstarted process handle', async () => {
+  const controller = new AbortController(), commands = new Commands(() => deployment, {}, controller.signal)
+  const pending = commands.run(new URL('./fixtures/missing-acceptance-cli', import.meta.url).pathname, [])
+  controller.abort()
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+})
+it('cancels a successfully spawned command and reports an abort rather than a timeout', async () => {
+  const controller = new AbortController(), commands = new Commands(() => deployment, {}, controller.signal)
+  const pending = commands.run(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'])
+  setTimeout(() => { controller.abort() }, 30)
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
 })

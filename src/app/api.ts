@@ -1,5 +1,5 @@
 /** Type-only management API contract between the web panel and host routes, imported by the panel without bundling host code. */
-import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ModelCatalog } from '../runtime/types.ts'
 import type { PromptConfig, Prompts } from './prompts.ts'
 import type { PromptsView, StateView, TicketPageView } from './http.ts'
 import type { HistoryView } from './settings-history.ts'
@@ -17,12 +17,32 @@ interface Paged { offset?: number; limit?: number }
 /** Whether a context update was already injected into the main Session or is still pending delivery. */
 type Delivery = 'injected' | 'pending'
 
+export type DeploymentLimitField = 'promptMaxChars' | 'admissionContextMaxPages' | 'admissionContextTimeoutMs'
+export type DeploymentOp = { op: 'set'; path: [DeploymentLimitField]; value: number }
+  | { op: 'unset'; path: [DeploymentLimitField] }
+export interface DeploymentView {
+  revision: number
+  value: {
+    stateDir: string
+    readonly instanceId?: string | null
+    readonly listen?: { readonly host: string; readonly port: number }
+    readonly paseoEndpoint?: string
+    promptMaxChars?: number
+    admissionContextMaxPages?: number
+    admissionContextTimeoutMs?: number
+  }
+  writable: boolean
+}
+
 export interface Api {
   'GET state': { response: StateView }
   'GET overview': { response: OverviewView }
   'GET search': { query: { q: string }; response: SearchView }
   'GET sources': { response: SourceStatusView[] }
   'GET settings': { response: SettingsView }
+  'GET deployment': { response: DeploymentView }
+  'PUT deployment': { body: { revision: number; ops: DeploymentOp[] }; response: DeploymentView }
+  'GET sessions/:id/link': { response: { url: string } }
   'POST sources/:id/labels': { response: { added: string[] } }
   'GET threads': { query?: Paged & { filter?: ThreadFilter }; response: ThreadListView }
   'GET threads/:key': { query?: { limit?: number; before?: string; around?: string }; response: ThreadDetailView }

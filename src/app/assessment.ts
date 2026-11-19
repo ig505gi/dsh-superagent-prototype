@@ -1,5 +1,5 @@
 /** Proactive candidate assessment for the main Session: relays candidate cards, serves bounded context reads, and records outcomes. */
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent } from '../runtime/types.ts'
 import { z } from 'zod'
 import { reasonText, threadKey, type Assessor, type AssessmentOutcome, type Candidate, type EngineForMainSession,
   type Trigger } from '../core/index.ts'
@@ -96,7 +96,9 @@ export class MasterAssessor implements Assessor {
     host.effects.handle('assessment', async ({ triggerId }, evalId) => {
       const candidate = this.host.engine.candidate(triggerId)
       if (candidate?.evalId !== evalId) return
-      await this.host.deliver(`candidate:${evalId}`, JSON.stringify({ kind: 'candidate', ...await this.host.candidateCard(candidate) }))
+      const card = await this.host.candidateCard(candidate)
+      if (this.host.engine.candidate(triggerId)?.evalId !== evalId) return
+      await this.host.deliver(`candidate:${evalId}`, JSON.stringify({ kind: 'candidate', ...card }))
       this.host.engine.candidateDelivered(evalId)
     }, { limit: () => host.paused() ? 0 : 4 })
   }
@@ -104,6 +106,17 @@ export class MasterAssessor implements Assessor {
   request(candidate: Candidate): void { this.host.effects.enqueue('assessment', candidate.evalId, { triggerId: candidate.triggers[0]!.id }) }
   /** Whether `evalId` is still the active evaluation for `trigger`. */
   private live(evalId: string, trigger: Trigger): boolean { return this.host.engine.candidate(trigger.id)?.evalId === evalId }
+  /** Scope an ended read to its captured window; name a replacement only when the Engine currently holds one. */
+  private finished(evalId: string, trigger: Trigger): Error {
+    const current = this.host.engine.candidate(trigger.id)
+    const replacement = current && current.evalId !== evalId ? current : undefined
+    return new Error(`${FINISHED}.\n${JSON.stringify({ eval_id: evalId, trigger_id: trigger.id,
+      scope: 'Only the named eval_id has finished; this result does not close a different evaluation window.',
+      ...(replacement ? { current_eval_id: replacement.evalId, current_policy_version: replacement.policyVersion,
+        next_action: replacement.strength === 'explicit' ? EXPLICIT
+          : 'Call orchestrator_eval with this trigger_id to load the different current window before deciding; do not reuse the finished window.' }
+        : { next_action: 'No different current assessment window is in progress for this trigger. Do not reopen or poll the finished window.' }) })}`)
+  }
   /** Drop an Eval's context and reads once it finishes; any running load for it discards its result. */
   release(evalId: string): void { this.evals.delete(evalId) }
   /** Resolve the active evaluation for a trigger; historical triggers have none, and explicit requests are routed instead. */
@@ -119,7 +132,7 @@ export class MasterAssessor implements Assessor {
     let reads = this.evals.get(evalId)
     if (!reads) {
       // Reject reads after the evaluation ends so completed evaluations do not retain cached state.
-      if (!this.live(evalId, trigger)) throw new Error(FINISHED)
+      if (!this.live(evalId, trigger)) throw this.finished(evalId, trigger)
       const context = this.host.threadContext(trigger)
       const messages = new Map([[context?.messageId ?? '', trigger.text]])
       reads = { cache: { snapshots: new Map(), images: new Map(), messages, cursors: new Set() } }
@@ -170,7 +183,7 @@ export class MasterAssessor implements Assessor {
     }
     await loading
     caller?.throwIfAborted()
-    if (!this.live(evalId, trigger)) throw new Error(FINISHED)
+    if (!this.live(evalId, trigger)) throw this.finished(evalId, trigger)
   }
   /**
    * Returns the `orchestrator_eval` payload: the trigger's text once (up to `TRIGGER_CHARS`), batch peers, related tickets
@@ -206,7 +219,7 @@ export class MasterAssessor implements Assessor {
     })() : { error: error ?? 'Call orchestrator_eval to load initial context', complete: false }
     const settings = this.host.settings()
     const others = candidate.triggers.filter(item => item.id !== trigger.id)
-    return { trigger_id: trigger.id, strength: candidate.strength, mode: settings.eval.mode,
+    return { eval_id: candidate.evalId, trigger_id: trigger.id, strength: candidate.strength, mode: settings.eval.mode,
       source: { kind: trigger.source, actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), ...(trigger.url
         ? { url: trigger.url } : {}) },
       ...cut(trigger.text, TRIGGER_CHARS), ...imageIds(source?.messageId ?? '', trigger.text),

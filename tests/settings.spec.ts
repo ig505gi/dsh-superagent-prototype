@@ -13,19 +13,18 @@ function deferred<T>() {
   const promise = new Promise<T>(settle => { resolve = settle })
   return { promise, resolve }
 }
-const model = { provider: 'worker-provider', model: 'worker-model' }
+const model = { profileId: 'worker', name: 'Worker Profile', provider: 'worker-provider', model: 'worker-model' }
 
 it('refuses a save of a block that another save changed during its model or account check, and saves nothing of it', async () => {
   h = await startRuntime()
   const { settings, store } = h.runtime
-  const llm = (h.ctx as unknown as { llm: { resolveCallConfig: ReturnType<typeof vi.fn> } }).llm
   const check = deferred<unknown>()
-  llm.resolveCallConfig.mockImplementationOnce(() => check.promise)
+  Object.assign(h.controller, { modelCatalog: vi.fn(() => check.promise) })
   const executor = store.settings().executor
   const revision = store.blockRevision('executor')
   const slow = settings.save('executor', { ...executor, model, maxWorkers: 5 }, revision, 'panel')
   await settings.save('executor', { ...executor, maxWorkers: 2 }, revision, 'panel')
-  check.resolve(model)
+  check.resolve({ profiles: [{ ...model, available: true }], failures: [] })
   await expect(slow).rejects.toThrow(SettingsConflict)
   expect(store.settings().executor).toMatchObject({ maxWorkers: 2, model: executor.model })
   // An account check that a save of the same Source outruns is refused the same way.

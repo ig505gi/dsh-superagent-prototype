@@ -1,5 +1,6 @@
+import { trashSync } from './fixtures/trash.ts'
 /** Thread timeline pagination, neighbour lookup, and timestamp normalization. */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it } from 'vitest'
@@ -17,7 +18,7 @@ beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), 'dsh-superagent-timeline-'))
   store = new Store(join(directory, 'orchestrator.sqlite'))
 })
-afterEach(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
+afterEach(() => { store.close(); trashSync(directory, { recursive: true, force: true }) })
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(githubKind)
 const host = () => ({ store, sources, links: (channel: ChannelRef) => githubLink(channel.address, {}) })

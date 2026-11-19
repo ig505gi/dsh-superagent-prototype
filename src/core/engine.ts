@@ -54,6 +54,10 @@ export class Engine {
   bindThread(ticketId: string, thread: ThreadRef, own: boolean): Ticket {
     return this.repo.atomic(() => this.tickets.bind(ticketId, thread, own))
   }
+  /** Restore a Source's reply channel on an open ticket created before it supported outbound messages. */
+  bindChannel(ticketId: string, channel: ChannelRef): Ticket {
+    return this.repo.atomic(() => this.tickets.bindChannel(ticketId, channel))
+  }
   /**
    * A Source's fact that a Thread closed, such as its pull request's merge, at the time it happened. An open ticket that
    * follows it ends once it is done with the Threads it follows, unless work resumed since the close has not finished, or
@@ -258,7 +262,7 @@ export class Engine {
 }
 
 /** What Sources ask and tell the Engine. */
-export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
+export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'bindChannel' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
 export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */

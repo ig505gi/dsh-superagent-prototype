@@ -22,6 +22,10 @@ import { When } from './widgets.tsx'
 export interface AppProps {
   t: T; openSession: (sessionId: string) => Promise<void>
   deploymentForm: DeploymentForm
+  lang?: 'zh' | 'en'
+  onToggleLang?: () => void
+  theme?: 'system' | 'light' | 'dark'
+  onCycleTheme?: () => void
 }
 
 function Glossary({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -98,8 +102,19 @@ function SearchResults({ result, query, onClose }: { result: SearchView; query: 
   </div>
 }
 
-function Header({ masterId }: { masterId: string | undefined }) {
+function Header({ masterId, instanceId, lang, onToggleLang, theme, onCycleTheme }: {
+  instanceId: string | null | undefined
+  masterId: string | undefined; lang?: 'zh' | 'en' | undefined; onToggleLang?: (() => void) | undefined
+  theme?: 'system' | 'light' | 'dark' | undefined; onCycleTheme?: (() => void) | undefined
+}) {
   const { t, call, openSession, notify } = usePanel()
+  const title = t('title')
+  useEffect(() => {
+    if (!instanceId) return
+    const previous = document.title
+    document.title = `${title} · ${instanceId}`
+    return () => { document.title = previous }
+  }, [instanceId, title])
   const [glossary, setGlossary] = useState(false)
   const [query, setQuery] = useState('')
   const [result, setResult] = useState<{ query: string; value: SearchView }>()
@@ -121,14 +136,24 @@ function Header({ masterId }: { masterId: string | undefined }) {
     call('GET search', { query: { q: text } }).then(value => { if (request === latest.current) setResult({ query: text, value }) },
       failure => { if (request === latest.current) notify(errorText(failure)) })
   }
+  const activeTheme = theme ?? 'system'
+  const themeIcon = activeTheme === 'dark' ? 'moon' : activeTheme === 'light' ? 'sun' : 'monitor'
+  const themeLabel = t('switchTheme', { mode: t(`theme.${activeTheme}`) })
   return <header className="dt-head">
-    <div className="dt-head-title"><h1 className="dt-title">{t('title')}</h1></div>
+    <div className="dt-head-title">
+      <h1 className="dt-title">{title}</h1>
+      {instanceId && <p className="dt-hint dt-mono">{instanceId}</p>}
+    </div>
     <div className="dt-toolbar">
       <form ref={search} className="dt-search" role="search" onSubmit={submit} onKeyDown={event => { if (event.key === 'Escape') show() }}>
         <Input type="search" icon={<Icon name="search" />} value={query} placeholder={t('searchPlaceholder')} aria-label={t('searchLabel')}
           onChange={event => { setQuery(event.target.value); if (!event.target.value) show() }} />
         {result && <SearchResults result={result.value} query={result.query} onClose={() => { show() }} />}
       </form>
+      {onToggleLang && <Button variant="ghost" size="sm" aria-label={t('switchLang')} title={t('switchLang')}
+        onClick={onToggleLang}>{lang === 'en' ? '中文' : 'EN'}</Button>}
+      {onCycleTheme && <Button variant="ghost" size="sm" icon={<Icon name={themeIcon} size={14} />}
+        aria-label={themeLabel} title={themeLabel} onClick={onCycleTheme} />}
       <Button variant="ghost" size="sm" icon={<Icon name="question" />} aria-label={t('glossary')} title={t('glossary')} aria-haspopup="dialog"
         onClick={() => setGlossary(true)} />
       <Button variant="outline" size="sm" icon={<Icon name="session" size={14} />} disabled={!masterId}
@@ -138,7 +163,11 @@ function Header({ masterId }: { masterId: string | undefined }) {
   </header>
 }
 
-function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm }) {
+function Pages({ route, openTab, deploymentForm, lang, onToggleLang, theme, onCycleTheme }: {
+  route: Route; openTab: (tab: Tab) => void; deploymentForm: DeploymentForm
+  lang?: 'zh' | 'en' | undefined; onToggleLang?: (() => void) | undefined
+  theme?: 'system' | 'light' | 'dark' | undefined; onCycleTheme?: (() => void) | undefined
+}) {
   const { t } = usePanel()
   const { state, error, reload } = usePanelData()
   // Keep the active tab scrolled into view on narrow screens when routes change via links.
@@ -160,7 +189,8 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
   })()
   return <div className="dt-page">
     <div className="dt-column">
-      <Header masterId={state?.masterId} />
+      <Header masterId={state?.masterId} instanceId={deploymentForm?.state.value.instanceId}
+        lang={lang} onToggleLang={onToggleLang} theme={theme} onCycleTheme={onCycleTheme} />
       {error && state && <p className="dt-error" role="status">{error.message}</p>}
       <SegmentedTabs className="dt-tabs" label={t('pagesLabel')} value={route.page} onChange={openTab}
         items={TABS.map(value => ({ value, label: t(`tab.${value}`), id: `dt-tab-${value}`, panelId: 'dt-page' }))} />
@@ -170,7 +200,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
 }
 
 /** Root panel component managing route history and shared panel state. */
-export function App({ t, openSession, deploymentForm }: AppProps) {
+export function App({ t, openSession, deploymentForm, lang, onToggleLang, theme, onCycleTheme }: AppProps) {
   const [location, setLocation] = useState(initialLocation)
   useEffect(() => { remember(location) }, [location])
   // Preserve the last opened settings group across navigation so the Settings tab reopens at it.
@@ -183,6 +213,7 @@ export function App({ t, openSession, deploymentForm }: AppProps) {
   const openTab = useCallback((tab: Tab) => move(current => ({ stack: [], route: tab === 'settings'
     ? settingsRoute(lastSettingsGroup(current)) : { page: tab, id: undefined } })), [move])
   return <PanelProvider t={t} openSession={openSession} navigate={navigate} back={back} backLabel={routeLabel(t, location.stack.at(-1) ?? HOME)}>
-    <Pages route={location.route} openTab={openTab} deploymentForm={deploymentForm} />
+    <Pages route={location.route} openTab={openTab} deploymentForm={deploymentForm} lang={lang} onToggleLang={onToggleLang}
+      theme={theme} onCycleTheme={onCycleTheme} />
   </PanelProvider>
 }

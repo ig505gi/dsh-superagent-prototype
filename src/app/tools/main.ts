@@ -1,6 +1,6 @@
 /** Main Session tools for routing triggers, assessing candidates, sending replies, and updating settings and prompts. */
-import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Context } from '../../runtime/context.ts'
+import type { Agent } from '../../runtime/types.ts'
 import { z } from 'zod'
 import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'

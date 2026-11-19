@@ -1,9 +1,9 @@
 /** Downloads Feishu message images and commits them as model-visible attachments during assessment. */
-import { mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, stat } from 'node:fs/promises'
+import { retireOwned } from '../infra/retention.ts'
 import { dirname, extname, join } from 'node:path'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import type {} from '@deepseek-ai/dsh-llm'
+import type { Agent } from '../runtime/types.ts'
+import type { ImageAttachmentRef, ImageMediaType } from '../runtime/types.ts'
 import { z } from 'zod'
 import type { Commands } from '../infra/commands.ts'
 import type { FeishuRef } from './feishu-read.ts'
@@ -50,6 +50,6 @@ export async function readAdmissionImage(agent: Agent, commands: Commands, ref: 
     signal.throwIfAborted()
     return { source_message_id: messageId, image_key: imageKey, image }
   } finally {
-    await rm(directory, { recursive: true, force: true })
+    await retireOwned(directory, join(stateDir, 'retired-images'))
   }
 }

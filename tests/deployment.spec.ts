@@ -1,5 +1,6 @@
+import { trashSync } from './fixtures/trash.ts'
 import { execFile } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -34,7 +35,7 @@ beforeEach(async () => {
   await exec('git', ['init', '-q', join(dir, 'widgets')], { env: gitEnv() })
   await exec('git', ['-C', join(dir, 'widgets'), 'remote', 'add', 'origin', 'git@github.com:acme/widgets.git'], { env: gitEnv() })
 })
-afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+afterEach(() => { trashSync(dir, { recursive: true, force: true }) })
 
 // Setup spawns CLI subprocesses that can take several seconds when tests run in parallel.
 vi.setConfig({ testTimeout: 30_000 })
@@ -58,16 +59,18 @@ describe('configuration schema', () => {
 
 describe('setup', () => {
   it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
-    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
-    expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
-    expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
+    const deployment = await resolveDeployment(machine(), { github: { repository: 'acme/widgets', cli: 'gh' } }, probe, path)
+    expect(deployment).toMatchObject({ repository: 'acme/widgets',
+      forge: { kind: 'github', host: 'github.com', cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
+    expect(deployment.forge).toEqual({ kind: 'github', host: 'github.com', cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot',
+      noreply: '7+Agent-Bot@users.noreply.github.com' })
     expect(deployment).not.toHaveProperty('feishu')
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
-    expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
+    expect((await resolveDeployment(machine(), { github: { repository: 'acme/gadgets', cli: 'gh' } }, probe, path)).repository).toBe('acme/widgets')
   })
   it('names what setup needs and where it is set', async () => {
     const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>
-      expect(resolveDeployment(machine(), github, probe, path)).rejects.toEqual(setupError(place, code, values))
+      expect(resolveDeployment(machine(), { github }, probe, path)).rejects.toEqual(setupError(place, code, values))
     const repository = 'acme/widgets'
     await needs('github', 'repositoryUnset', {}, { cli: 'gh' })
     await needs('github', 'agentCliUnset', {}, { repository })
@@ -82,6 +85,48 @@ describe('setup', () => {
     await needs('github', 'repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets', output }, { repository, cli: unreadable })
     await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(join(dir, 'bin', 'gh-anonymous'), `echo '{}'`) })
     expect(() => executable('nothing-here', join(dir, 'bin'))).toThrow('nothing-here is not an executable file on PATH')
+  })
+  it('reads a self-hosted GitLab project from the agent\'s glab, addressing it by its URL-encoded path', async () => {
+    const glab = (file: string, body: string): string => program(file, body)
+    glab(join(dir, 'bin', 'glab'), [
+      'case "$*" in',
+      '  "api user --hostname gitlab.example.com") echo \'{"id":9,"username":"Agent-Bot"}\' ;;',
+      '  "api projects/group%2Fsub%2Fwidgets --hostname gitlab.example.com") echo \'{"path_with_namespace":"group/sub/widgets","permissions":{"project_access":{"access_level":40}}}\' ;;',
+      '  *) echo "unexpected $*" >&2; exit 1 ;;',
+      'esac',
+    ].join('\n'))
+    const deployment = await resolveDeployment(machine(), { gitlab: { host: 'gitlab.example.com', project: 'group/sub/widgets', cli: 'glab' } }, probe, path)
+    expect(deployment).toMatchObject({ repository: 'group/sub/widgets',
+      forge: { kind: 'gitlab', host: 'gitlab.example.com', login: 'Agent-Bot', cli: join(dir, 'bin', 'glab') } })
+    // A self-managed instance has no noreply domain, so the commit address follows the instance.
+    expect(deployment.forge.noreply).toBe('Agent-Bot@users.noreply.gitlab.example.com')
+  })
+  it('keeps the port of an instance served on one, but not in the commit address', async () => {
+    program(join(dir, 'bin', 'glab-ported'), `case "$*" in\n  "api user --hostname gitlab.example.com:8443") echo '{"id":9,"username":"Agent-Bot"}' ;;\n  "api projects/group%2Fwidgets --hostname gitlab.example.com:8443") echo '{"path_with_namespace":"group/widgets","permissions":{"project_access":{"access_level":40}}}' ;;\n  *) exit 1 ;;\nesac`)
+    const deployment = await resolveDeployment(machine(), { gitlab: { host: 'gitlab.example.com:8443', project: 'group/widgets', cli: 'glab-ported' } }, probe, path)
+    expect(deployment.forge.host).toBe('gitlab.example.com:8443')
+    expect(deployment.forge.noreply).toBe('Agent-Bot@users.noreply.gitlab.example.com')
+  })
+  it('names what GitLab setup needs, and refuses two forges at once', async () => {
+    const needs = (code: string, values: Record<string, unknown>, gitlab: unknown) =>
+      expect(resolveDeployment(machine(), { gitlab }, probe, path)).rejects.toEqual(setupError('gitlab', code, values))
+    await needs('gitlabHostUnset', {}, { project: 'group/widgets', cli: 'glab' })
+    await needs('projectUnset', {}, { host: 'gitlab.example.com', cli: 'glab' })
+    await needs('gitlabCliUnset', {}, { host: 'gitlab.example.com', project: 'group/widgets' })
+    await needs('gitlabCliMissing', { output: `${join(dir, 'missing')} is not an executable file` },
+      { host: 'gitlab.example.com', project: 'group/widgets', cli: join(dir, 'missing') })
+    const signedOut = program(join(dir, 'bin', 'glab-broken'), 'exit 1')
+    await needs('gitlabCliSignedOut', {}, { host: 'gitlab.example.com', project: 'group/widgets', cli: signedOut })
+    // Guest access is not enough to push, and GitLab reports no permission block to an outsider at all.
+    const guest = program(join(dir, 'bin', 'glab-guest'), `case "$*" in\n  "api user --hostname gitlab.example.com") echo '{"id":9,"username":"Agent-Bot"}' ;;\n  *) echo '{"path_with_namespace":"group/widgets","permissions":{"project_access":{"access_level":20}}}' ;;\nesac`)
+    await needs('projectReadOnly', { account: 'Agent-Bot', repository: 'group/widgets' },
+      { host: 'gitlab.example.com', project: 'group/widgets', cli: guest })
+    const outsider = program(join(dir, 'bin', 'glab-outsider'), `case "$*" in\n  "api user --hostname gitlab.example.com") echo '{"id":9,"username":"Agent-Bot"}' ;;\n  *) echo 'HTTP 404' >&2; exit 1 ;;\nesac`)
+    await needs('projectUnreadable', { account: 'Agent-Bot', repository: 'group/widgets', output: expect.stringContaining('HTTP 404') as unknown },
+      { host: 'gitlab.example.com', project: 'group/widgets', cli: outsider })
+    expect(resolveDeployment(machine(), { github: { repository: 'acme/widgets', cli: 'gh' },
+      gitlab: { host: 'gitlab.example.com', project: 'group/widgets', cli: 'glab' } }, probe, path))
+      .rejects.toEqual(setupError('deployment', 'forgeAmbiguous'))
   })
   it('reads the Feishu bot from a bot-only lark-cli, or finds none when the Feishu Source names no CLI', async () => {
     expect(await resolveFeishuBot(machine(), {}, probe, path)).toBeUndefined()

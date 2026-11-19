@@ -14,7 +14,7 @@ export function TicketLine({ ticket, question, onChanged, context }: {
   const status = ticketMark(t, ticket)
   const after = async (request: Promise<unknown>) => { await request; await onChanged?.() }
   const note = question && ticket.note && { ...ticket.note, text: readableMarkers(t, ticket.note.text) }
-  const answer = ticket.reply && ticket.stage === 'person' && ticket.action === 'answer' ? ticket.reply : undefined
+  const answer = ticket.reply?.url && ticket.stage === 'person' && ticket.action === 'answer' ? ticket.reply : undefined
   return <li className="dt-row dt-link dt-ticket" data-state={question ? status.dot : undefined}>
     <div className="dt-ticket-stage"><StageMark state={status.dot} icon={status.icon} label={status.label} /></div>
     <div className="dt-ticket-body">
@@ -34,7 +34,8 @@ export function TicketLine({ ticket, question, onChanged, context }: {
         {ticket.actions.retry && <ConfirmButton variant="outline" icon="refresh" label={t('retry')} title={t('retryTitle')}
           message={t('retryConfirm', { title: ticket.title })}
           onConfirm={() => after(call('POST tickets/:id/retry', { id: ticket.id }))} />}
-        {ticket.actions.retry && ticket.sessionId && <SessionButton variant="outline" sessionId={ticket.sessionId} />}
+        {ticket.sessionId && (ticket.actions.retry || (ticket.stage === 'person' && ticket.action === 'answer' && !answer))
+          && <SessionButton variant="outline" sessionId={ticket.sessionId} />}
         {ticket.actions.stop && <ConfirmButton variant="outline" icon="stop" label={t('stop')} title={t('stopConfirmTitle')}
           message={t('stopConfirm', { title: ticket.title })}
           onConfirm={() => after(call('POST tickets/:id/stop', { id: ticket.id }))} />}

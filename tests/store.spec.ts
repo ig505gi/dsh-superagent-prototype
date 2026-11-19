@@ -1,4 +1,5 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { trashSync } from './fixtures/trash.ts'
+import { mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,7 +14,7 @@ import { SettingsSchema } from '../src/policy.ts'
 
 let directory: string
 beforeEach(() => { directory = mkdtempSync(join(tmpdir(), 'orchestrator-store-')) })
-afterEach(() => { rmSync(directory, { recursive: true, force: true }) })
+afterEach(() => { trashSync(directory, { recursive: true, force: true }) })
 
 it('refuses databases newer than this build and rolls back failed atomic work', () => {
   const path = join(directory, 'orchestrator.sqlite')

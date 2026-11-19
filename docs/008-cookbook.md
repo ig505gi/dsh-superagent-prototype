@@ -14,7 +14,7 @@ The example assumes this CLI contract:
 - `hookq reply --conversation <id> --to <message id> --key <key> --text <text>` replies under a message, once per key. For a conversation that was deleted it fails with `{"error": {"code": 410, "message": "…"}}` on standard error.
 - `hookq thread --conversation <id> --root <message id> --json`, with `--after <cursor>` for a later page, prints a page of a thread, oldest first: `{"items": […], "next": "<cursor>"}`, without `next` on the last page.
 
-Put the kind and its plugin entry in `src/sources/webhook.ts`, following `src/sources/github.ts`. If the Source grows, split translation, Channel and polling code into separate modules as the Feishu Source does.
+Put the kind and its entry in `src/sources/webhook.ts`, following `src/sources/github.ts`. If the Source grows, split translation, Channel and polling code into separate modules as the Feishu Source does.
 
 ### 1. Map the events onto the domain
 
@@ -174,7 +174,7 @@ export async function sendWebhook(host: Pick<SourceContext, 'commands'>, message
 }
 ```
 
-- **Idempotent sends.** Outbox calls `SourceRegistry.send`, which invokes `channel.send`. Messages wait while the Source plugin is unloaded. A send may fail after the remote service received it, so retries must not duplicate messages. Use `message.id` as an idempotency key: `hookq` supports `--key`; GitHub stores a hidden comment marker; Feishu accepts an idempotency key.
+- **Idempotent sends.** Outbox calls `SourceRegistry.send`, which invokes `channel.send`. Messages wait while the Source kind is not registered. A send may fail after the remote service received it, so retries must not duplicate messages. Use `message.id` as an idempotency key: `hookq` supports `--key`; GitHub stores a hidden comment marker; Feishu accepts an idempotency key.
 - **Permanent versus retryable failure.** Return `sent` on success and `gone` only when delivery is permanently impossible, such as the example's 410. A gone message is retained as dropped and never queued again; it appears in `GET sources` and on the Source page. Throw for other failures so Outbox retries after 5 seconds, doubling to 300 seconds. `CliError.code` is the code reported by the CLI output.
 - **Allowed destinations.** `allowed(address, config)` checks only the saved address and current configuration. Put every required fact in the address; for example, Feishu records whether the chat is direct. A destination no longer listened to is dropped, while a disabled Source leaves messages waiting. Without `allowed`, all addresses are permitted while the Source is enabled.
 - **Links.** `link(address, links)` returns the URL and label the panel displays through `SourceRegistry.link`.
@@ -249,17 +249,15 @@ Execution settings show declared `variables` beside the prepare command even whe
 
 The prepare command reads environment variables; the worker reads their values in its instructions. Use the `DSH_SUPERAGENT_<KIND>_…` prefix, return an empty value for Tickets from another Source, and never include credentials.
 
-### 9. The plugin entry and its loop
+### 9. The Source entry and its loop
 
 ```ts
-export const name = 'dsh-superagent-webhook'
-export const inject = ['orchestrator']
 export function apply(ctx: Context): void {
   ctx.effect(() => ctx.orchestrator.sources.register(webhookKind), 'webhook: source kind')
   ctx.effect(() => {
     const source = sourceContext(ctx.orchestrator, webhookKind)
     const controller = new AbortController()
-    // DSH ends its process on an unhandled rejection, so a failure that escapes the loop becomes the Source's health.
+    // Report a failure that escapes the loop as the Source's health instead of leaving an unhandled rejection.
     const running = watch(source, controller.signal)
       .catch((error: unknown) => { source.report('webhook', { state: 'error', detail: String(error) }) })
     return async () => { controller.abort(); await running }
@@ -267,7 +265,7 @@ export function apply(ctx: Context): void {
 }
 ```
 
-The plugin injects `orchestrator`. Its first effect registers the kind and unregisters it on disposal. The second runs the polling loop with a `SourceContext`. Disposal aborts the loop and awaits completion, including during application stop or restart.
+The standalone application calls the entry with a Context that provides `orchestrator`. Its first effect registers the kind and unregisters it on disposal. The second runs the polling loop with a `SourceContext`. Disposal aborts the loop and awaits completion, including during application stop or restart.
 
 ```ts
 async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
@@ -331,24 +329,28 @@ This example does not send Source-originated notices. A Source that needs them c
 
 It also does not bind Threads to Ticket completion. Use `ctx.tickets.bindThread` and `threadClosed` only when a Source's Thread lifecycle determines whether work is done, as GitHub pull requests do. The Engine still decides when the Ticket ends.
 
-### 10. Register the plugin
+### 10. Register the Source
 
-Build the module as its own entry in `tsdown.config.ts`:
+Add the module to the `entry` array in `tsdown.config.ts`:
 
 ```ts
-entry: { index: 'src/index.ts', 'github-watch': 'src/sources/github.ts', 'feishu-watch': 'src/sources/feishu.ts',
-  'webhook-watch': 'src/sources/webhook.ts' },
+entry: ['src/index.ts', 'src/server/main.ts', 'src/runtime/tool-cli.ts', 'src/runtime/job-runner.ts',
+  'src/sources/github.ts', 'src/sources/gitlab.ts', 'src/sources/feishu.ts', 'src/sources/dingtalk.ts', 'src/sources/paseo.ts',
+  'src/sources/webhook.ts'],
 ```
 
-Then export the built file in `package.json` by adding `"./webhook-watch": "./lib/webhook-watch.js"` to `exports`, and add the plugin to the `insert` list of the bundle's `cordis.patch.yml`, disabled, as Feishu is:
+In `src/server/application.ts`, import the entry and add it to the Sources called with the adapter's Context:
 
-```yaml
-    - id: dsh-superagent-webhook
-      name: dsh-superagent/webhook-watch
-      disabled: true
+```ts
+import { apply as webhook } from '../sources/webhook.ts'
+
+// In mount, after the Runtime is created:
+for (const source of [github, gitlab, feishu, dingtalk, paseo, webhook]) source(nextAdapter.context)
 ```
 
-Enable the plugin in a profile's `cordis.patch.yml` with `id: dsh-superagent-webhook` and `disabled: false`. Build and restart. The new Source appears in Sources settings and under **Eval → On each Source**.
+Build and restart the standalone application. The new Source appears in Sources settings and under **Eval → On each Source**; configure its conversations and Policy there. Before settings are saved, the Source is enabled with its schema defaults, which match no conversations in this example.
+
+To expose the built module to package consumers as well, add `"./webhook-watch": "./lib/sources/webhook.js"` to `exports` in `package.json`.
 
 Add its module and spec to the module and test tables in [007 Architecture](007-architecture.md). `tests/docs.spec.ts` checks that both indexes are complete.
 
@@ -407,7 +409,7 @@ it('takes in what the queue holds after the cursor, once, and moves the cursor a
 - a round cut short, which keeps its cursor;
 - `send`: `sent`, `gone` for a 410 only, and a throw for any other failure, with the CLI's error built by `commandError`;
 - the Thread context: the messages of a page and the cursor of the next, as `tests/registry.spec.ts` reads a kind's Threads through `SourceRegistry.threadContext`;
-- the plugin: `apply` registers the kind and reports `setupPending` while setup waits, its disposers unregister the kind, and a failure that escapes the loop becomes the Source's health instead of an unhandled rejection;
+- the entry: `apply` registers the kind and reports `setupPending` while setup waits, its disposers unregister the kind, and a failure that escapes the loop becomes the Source's health instead of an unhandled rejection;
 - the Source's part of the Policy and its admission rows, as `tests/registry.spec.ts` and `tests/policy.spec.ts` check the Feishu Source's.
 
 ### Checklist
@@ -420,6 +422,6 @@ it('takes in what the queue holds after the cursor, once, and moves the cursor a
 6. Give assessments its Thread context, if it can read a Thread.
 7. Give it a part of the Policy with `allowed` and the admission rows.
 8. Register its execution environment variables.
-9. Write the plugin entry and a loop that waits for setup, follows the switch, moves cursors after `receive`, keeps errors per item, reports health and stops on abort; name the cursors in `KV`.
-10. Add the build entry, the export and the `cordis.patch.yml` insert, and list the module and its spec in the tables of 007.
+9. Write the Source entry and a loop that waits for setup, follows the switch, moves cursors after `receive`, keeps errors per item, reports health and stops on abort; name the cursors in `KV`.
+10. Add the build entry and register the Source in the standalone application; list the module and its spec in the tables of 007.
 11. Test it as `tests/sources.spec.ts` tests the other Sources.
